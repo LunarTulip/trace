@@ -1,10 +1,10 @@
 use std::{
+    cmp::Ordering,
     fs::{
         create_dir_all,
         read_to_string,
         write,
     },
-    
     path::{
         Path,
         PathBuf,
@@ -15,17 +15,20 @@ use argh::FromArgs;
 use directories::ProjectDirs;
 use futures::future::join_all;
 use matrix_sdk::{
-    Client,
-    SessionMeta,
-    config::SyncSettings,
-    matrix_auth::{
+    config::SyncSettings, matrix_auth::{
         MatrixSession,
         MatrixSessionTokens,
+    }, 
+    room::{
+        MessagesOptions,
+        Room,
     },
     ruma::{
+        OwnedRoomAliasId,
+        OwnedRoomId,
         UserId,
         presence::PresenceState,
-    }
+    }, Client, SessionMeta
 };
 use rpassword::read_password;
 use serde::{
@@ -103,6 +106,19 @@ impl SessionsFile {
     }
 }
 
+struct RoomWithCachedInfo {
+    id: OwnedRoomId,
+    name: Option<String>,
+    canonical_alias: Option<OwnedRoomAliasId>,
+    alt_aliases: Vec<OwnedRoomAliasId>,
+    room: Room,
+}
+
+enum RoomIndexRetrievalError {
+    MultipleRoomsWithSpecifiedName(Vec<String>),
+    NoRoomsWithSpecifiedName,
+}
+
 //////////////
 //   Args   //
 //////////////
@@ -117,8 +133,21 @@ struct Args {
 #[derive(FromArgs)]
 #[argh(subcommand)]
 enum RootSubcommand {
+    Export(Export),
     ListRooms(ListRooms),
     Session(SessionCommand),
+}
+
+#[derive(FromArgs)]
+#[argh(subcommand, name = "export")]
+/// Export logs from rooms
+struct Export {
+    #[argh(positional)]
+    /// user_id (of the form @alice:example.com) to export rooms accessible to
+    user_id: String,
+    #[argh(positional)]
+    /// space-separated list of room IDs (of the form !abcdefghijklmnopqr:example.com), aliases (of the form #room:example.com), or names to export
+    rooms: Vec<String>,
 }
 
 #[derive(FromArgs)]
@@ -216,29 +245,125 @@ async fn nonfirst_login(user_id: &str, sessions_file: &SessionsFile) -> anyhow::
     Ok(client)
 }
 
+async fn get_rooms_info(client: &Client) -> anyhow::Result<Vec<RoomWithCachedInfo>> {
+    let mut rooms_info = client.joined_rooms().into_iter().map(|room| RoomWithCachedInfo {
+        id: room.room_id().to_owned(),
+        name: room.name(),
+        canonical_alias: room.canonical_alias(),
+        alt_aliases: room.alt_aliases(),
+        room,
+    }).collect::<Vec<RoomWithCachedInfo>>();
+    rooms_info.sort_by(|room_1, room_2| match (&room_1.name, &room_2.name) {
+        (Some(name_1), Some(name_2)) => name_1.cmp(&name_2),
+        (Some(_name), None) => Ordering::Greater,
+        (None, Some(_name)) => Ordering::Less,
+        (None, None) => match (&room_1.canonical_alias, &room_2.canonical_alias) {
+            (Some(alias_1), Some(alias_2)) => alias_1.cmp(&alias_2),
+            (Some(_alias), None) => Ordering::Greater,
+            (None, Some(_alias)) => Ordering::Less,
+            (None, None) => room_1.id.cmp(&room_2.id),
+        },
+    });
+
+    Ok(rooms_info)
+}
+
+fn get_room_index_by_identifier(rooms_info: &Vec<RoomWithCachedInfo>, identifier: &str) -> Result<usize, RoomIndexRetrievalError> {
+    if let Some(index) = rooms_info.iter().position(|room_info| &room_info.id == identifier) {
+        Ok(index)
+    } else if let Some(index) = rooms_info.iter().position(|room_info| room_info.canonical_alias.as_ref().is_some_and(|alias| alias == identifier)) {
+        Ok(index)
+    } else if let Some(index) = rooms_info.iter().position(|room_info| room_info.alt_aliases.iter().any(|alias| alias == identifier)) {
+        Ok(index)
+    } else {
+        let name_matches = rooms_info.iter().filter(|room_info| room_info.name.as_ref().is_some_and(|name| name == identifier)).collect::<Vec<&RoomWithCachedInfo>>();
+        match name_matches.len() {
+            0 => Err(RoomIndexRetrievalError::NoRoomsWithSpecifiedName),
+            1 => Ok(rooms_info.iter().position(|room_info| room_info.name.as_ref().is_some_and(|name| name  == identifier)).unwrap()),
+            _ => Err(RoomIndexRetrievalError::MultipleRoomsWithSpecifiedName(name_matches.iter().map(|room_info| room_info.id.to_string()).collect())),
+        }
+    }
+}
+
+fn format_export_filename(room_info: &RoomWithCachedInfo) -> String {
+    let (nonserver_id_component, server) = room_info.id.as_str().split_once(':').unwrap();
+    match (&room_info.name, &room_info.canonical_alias) {
+        (Some(name), Some(alias)) => format!("{} [{}, {}, {}]", name, alias.as_str().split_once(':').unwrap().0, nonserver_id_component, server),
+        (Some(name), None) => format!("{} [{}, {}]", name, nonserver_id_component, server),
+        (None, Some(alias)) => format!("{} [{}, {}]", alias.as_str().split_once(':').unwrap().0, nonserver_id_component, server),
+        (None, None) => format!("{} [{}]", nonserver_id_component, server),
+    }
+}
+
 //////////////
 //   Main   //
 //////////////
 
-async fn list_rooms(config: ListRooms, sessions_file: &SessionsFile) -> anyhow::Result<()> {
-    // In the long run, replace this with something properly structured with the retrieval and display factored apart from one another
+async fn export(config: Export, sessions_file: &SessionsFile) -> anyhow::Result<()> {
+    // Allow setting export destination other than "directly where run"
     let client = nonfirst_login(&config.user_id, sessions_file).await?;
     client.sync_once(SyncSettings::new().set_presence(PresenceState::Offline)).await?;
-    let rooms = client.joined_rooms().into_iter().map(|r| r.name()).collect::<Vec<Option<String>>>();
-    println!("{:?}", rooms);
+
+    let accessible_rooms_info = get_rooms_info(&client).await?; // This should be possible to optimize out for request-piles without names included, given client.resolve_room_alias and client.get_room. Although that might end up actually costlier if handled indelicately, since it'll involve more serial processing.
+
+    for room_identifier in config.rooms {
+        let room_to_export_info = match get_room_index_by_identifier(&accessible_rooms_info, &room_identifier) {
+            Ok(index) => &accessible_rooms_info[index],
+            Err(e) => match e {
+                RoomIndexRetrievalError::MultipleRoomsWithSpecifiedName(room_ids) => {
+                    println!("Found more than one room accessible to {} with name {}. Room IDs: {:?}", config.user_id, room_identifier, room_ids);
+                    continue
+                },
+                RoomIndexRetrievalError::NoRoomsWithSpecifiedName => {
+                    println!("Couldn't find any rooms accessible to {} with name {}.", config.user_id, room_identifier);
+                    continue
+                },
+            }
+        };
+        let messages = room_to_export_info.room.messages(MessagesOptions::forward()).await?; // Could async this better; try that at some point. Also, looks like for now this is going to get only the first 10 messages?
+        let mut room_export = String::new();
+        for event in messages.chunk {
+            // Add real handling here; this is unreadable, right now
+            room_export.push_str(&format!("{:?}\n", event))
+        }
+        write(format!("{}.txt", format_export_filename(&room_to_export_info)), room_export).unwrap(); // Ideally let users pass format strings of some sort here
+    }
+
+    Ok(())
+}
+
+async fn list_rooms(config: ListRooms, sessions_file: &SessionsFile) -> anyhow::Result<()> {
+    let client = nonfirst_login(&config.user_id, sessions_file).await?;
+    client.sync_once(SyncSettings::new().set_presence(PresenceState::Offline)).await?;
+
+    let rooms_info = get_rooms_info(&client).await?;
+    println!("Rooms joined by {}:", config.user_id);
+    for room_info in rooms_info {
+        let room_name = match room_info.name {
+            Some(name) => name,
+            None => String::from("[Unnamed]"),
+        };
+        let room_alias = match room_info.canonical_alias {
+            Some(alias) => alias.to_string(),
+            None => String::from("[No canonical alias]"),
+        };
+        let room_id = room_info.id;
+        println!("{} | {} | {}", room_name, room_alias, room_id) // Replace with properly-justified table-formatting in the future
+    }
 
     Ok(())
 }
 
 async fn session_list(sessions_file: &SessionsFile) -> anyhow::Result<()> {
-    // In the long run, replace this with something properly structured with the retrieval and display factored apart from one another
     if sessions_file.sessions.len() > 0 {
-        let session_info_to_print = join_all(sessions_file.sessions.iter().map(|session| async {
+        let mut session_info_to_print = join_all(sessions_file.sessions.iter().map(|session| async {
             let client = nonfirst_login(&session.user_id, sessions_file).await?;
             let device_list = client.devices().await?.devices;
             let device_name = device_list.into_iter().find(|device| device.device_id == session.device_id).unwrap().display_name.unwrap_or_else(|| String::from("[Unnamed]"));
             anyhow::Result::<(&str, String)>::Ok((&session.user_id, device_name))
         })).await.into_iter().collect::<anyhow::Result<Vec<(&str, String)>, _>>()?;
+        session_info_to_print.sort_by_key(|(user_id, _display_name)| *user_id);
+
         println!("Currently-logged-in sessions:");
         for (user_id, session_name) in session_info_to_print {
             println!("{} | {}", user_id, session_name) // Replace with properly-justified table-formatting in the future
@@ -302,6 +427,7 @@ async fn main() -> anyhow::Result<()> {
 
     let args: Args = argh::from_env();
     match args.subcommand {
+        RootSubcommand::Export(config) => export(config, &sessions_file).await?,
         RootSubcommand::ListRooms(config) => list_rooms(config, &sessions_file).await?,
         RootSubcommand::Session(s) => match s.subcommand {
             SessionSubcommand::List(_) => session_list(&sessions_file).await?,
