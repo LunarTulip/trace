@@ -1,123 +1,26 @@
-use std::{
-    cmp::Ordering,
-    fs::{
-        create_dir_all,
-        read_to_string,
-        write,
-    },
-    path::{
-        Path,
-        PathBuf,
-    }
-};
+use std::fs::write;
+use std::path::Path;
+
+use trace::*;
 
 use argh::FromArgs;
 use directories::ProjectDirs;
 use futures::future::join_all;
 use matrix_sdk::{
-    config::SyncSettings, matrix_auth::{
-        MatrixSession,
-        MatrixSessionTokens,
-    }, 
-    room::{
-        MessagesOptions,
-        Room,
-    },
+    config::SyncSettings,
+    room::MessagesOptions,
     ruma::{
-        OwnedRoomAliasId,
-        OwnedRoomId,
-        UserId,
+        events::{
+            AnyMessageLikeEvent,
+            AnyTimelineEvent,
+        },
         presence::PresenceState,
-    }, Client, SessionMeta
+        UserId,
+    },
+    Client,
 };
 use rpassword::read_password;
-use serde::{
-    Deserialize,
-    Serialize,
-};
 use uuid::Uuid;
-
-///////////////////////
-//   Non-arg types   //
-///////////////////////
-
-#[derive(Clone, Deserialize, Serialize)]
-struct Session {
-    user_id: String,
-    device_id: String,
-    access_token: String,
-    refresh_token: Option<String>,
-}
-
-struct SessionsFile {
-    path: PathBuf,
-    sessions: Vec<Session>,
-}
-
-impl SessionsFile {
-    fn open(path: PathBuf) -> Self {
-        if let Ok(file) = read_to_string(&path) {
-            let sessions = serde_json::from_str(&file).expect("Sessions file is invalid JSON."); // Replace with better error-handling
-            Self {
-                path,
-                sessions,
-            }
-        } else {
-            create_dir_all(&path.parent().expect("Tried to open root as sessions file. (This should never happen.")).unwrap();
-            write(&path, "[]").unwrap();
-            Self {
-                path,
-                sessions: Vec::new(),
-            }
-        }
-    }
-
-    fn get(&self, user_id: &str) -> Result<Session, String> {
-        match self.sessions.iter().find(|session| &session.user_id == user_id) {
-            Some(session) => Ok(session.clone()),
-            None => Err(format!("Couldn't find currently-existing login session for user_id {}.", user_id))
-        }
-    }
-
-    fn delete_session(&mut self, user_id: &str) -> Result<(), String> {
-        match self.sessions.iter().position(|session| &session.user_id == user_id) {
-            Some(session_index) => {
-                self.sessions.remove(session_index);
-                self.write();
-                Ok(())
-            }
-            None => Err(format!("Couldn't find currently-existing login session for user_id {}.", user_id))
-        }
-    }
-
-    fn new_session(&mut self, session: Session) -> Result<(), String> {
-        if !self.sessions.iter().any(|preexisting_session| preexisting_session.user_id == session.user_id) {
-            self.sessions.push(session);
-            self.write();
-            Ok(())
-        } else {
-            Err(format!("Tried to create new session with user_id {}, but you already have a logged-in session with that user ID.", session.user_id))
-        }
-    }
-
-    fn write(&self) {
-        let updated_file = serde_json::to_string(&self.sessions).unwrap();
-        write(&self.path, updated_file).unwrap();
-    }
-}
-
-struct RoomWithCachedInfo {
-    id: OwnedRoomId,
-    name: Option<String>,
-    canonical_alias: Option<OwnedRoomAliasId>,
-    alt_aliases: Vec<OwnedRoomAliasId>,
-    room: Room,
-}
-
-enum RoomIndexRetrievalError {
-    MultipleRoomsWithSpecifiedName(Vec<String>),
-    NoRoomsWithSpecifiedName,
-}
 
 //////////////
 //   Args   //
@@ -214,87 +117,6 @@ struct SessionRename {
     session_name: String,
 }
 
-/////////////////
-//   Helpers   //
-/////////////////
-
-fn add_at_to_user_id_if_applicable(user_id: &str) -> String {
-    if user_id.starts_with('@') {
-        String::from(user_id)
-    } else {
-        format!("@{}", user_id)
-    }
-}
-
-async fn nonfirst_login(user_id: &str, sessions_file: &SessionsFile) -> anyhow::Result<Client> {
-    let normalized_user_id = add_at_to_user_id_if_applicable(user_id);
-    let session = sessions_file.get(&normalized_user_id).unwrap();
-    let user = UserId::parse(&session.user_id)?;
-    let client = Client::builder().server_name(user.server_name()).build().await?;
-    client.matrix_auth().restore_session(MatrixSession {
-        meta: SessionMeta {
-            user_id: user,
-            device_id: session.device_id.into(),
-        },
-        tokens: MatrixSessionTokens {
-            access_token: session.access_token,
-            refresh_token: session.refresh_token,
-        }
-    }).await?;
-
-    Ok(client)
-}
-
-async fn get_rooms_info(client: &Client) -> anyhow::Result<Vec<RoomWithCachedInfo>> {
-    let mut rooms_info = client.joined_rooms().into_iter().map(|room| RoomWithCachedInfo {
-        id: room.room_id().to_owned(),
-        name: room.name(),
-        canonical_alias: room.canonical_alias(),
-        alt_aliases: room.alt_aliases(),
-        room,
-    }).collect::<Vec<RoomWithCachedInfo>>();
-    rooms_info.sort_by(|room_1, room_2| match (&room_1.name, &room_2.name) {
-        (Some(name_1), Some(name_2)) => name_1.cmp(&name_2),
-        (Some(_name), None) => Ordering::Greater,
-        (None, Some(_name)) => Ordering::Less,
-        (None, None) => match (&room_1.canonical_alias, &room_2.canonical_alias) {
-            (Some(alias_1), Some(alias_2)) => alias_1.cmp(&alias_2),
-            (Some(_alias), None) => Ordering::Greater,
-            (None, Some(_alias)) => Ordering::Less,
-            (None, None) => room_1.id.cmp(&room_2.id),
-        },
-    });
-
-    Ok(rooms_info)
-}
-
-fn get_room_index_by_identifier(rooms_info: &Vec<RoomWithCachedInfo>, identifier: &str) -> Result<usize, RoomIndexRetrievalError> {
-    if let Some(index) = rooms_info.iter().position(|room_info| &room_info.id == identifier) {
-        Ok(index)
-    } else if let Some(index) = rooms_info.iter().position(|room_info| room_info.canonical_alias.as_ref().is_some_and(|alias| alias == identifier)) {
-        Ok(index)
-    } else if let Some(index) = rooms_info.iter().position(|room_info| room_info.alt_aliases.iter().any(|alias| alias == identifier)) {
-        Ok(index)
-    } else {
-        let name_matches = rooms_info.iter().filter(|room_info| room_info.name.as_ref().is_some_and(|name| name == identifier)).collect::<Vec<&RoomWithCachedInfo>>();
-        match name_matches.len() {
-            0 => Err(RoomIndexRetrievalError::NoRoomsWithSpecifiedName),
-            1 => Ok(rooms_info.iter().position(|room_info| room_info.name.as_ref().is_some_and(|name| name  == identifier)).unwrap()),
-            _ => Err(RoomIndexRetrievalError::MultipleRoomsWithSpecifiedName(name_matches.iter().map(|room_info| room_info.id.to_string()).collect())),
-        }
-    }
-}
-
-fn format_export_filename(room_info: &RoomWithCachedInfo) -> String {
-    let (nonserver_id_component, server) = room_info.id.as_str().split_once(':').unwrap();
-    match (&room_info.name, &room_info.canonical_alias) {
-        (Some(name), Some(alias)) => format!("{} [{}, {}, {}]", name, alias.as_str().split_once(':').unwrap().0, nonserver_id_component, server),
-        (Some(name), None) => format!("{} [{}, {}]", name, nonserver_id_component, server),
-        (None, Some(alias)) => format!("{} [{}, {}]", alias.as_str().split_once(':').unwrap().0, nonserver_id_component, server),
-        (None, None) => format!("{} [{}]", nonserver_id_component, server),
-    }
-}
-
 //////////////
 //   Main   //
 //////////////
@@ -323,8 +145,18 @@ async fn export(config: Export, sessions_file: &SessionsFile) -> anyhow::Result<
         let messages = room_to_export_info.room.messages(MessagesOptions::forward()).await?; // Could async this better; try that at some point. Also, looks like for now this is going to get only the first 10 messages?
         let mut room_export = String::new();
         for event in messages.chunk {
+            let event_stringified = match event.event.deserialize().unwrap() { // Add real error-handling in place of this unwrap
+                AnyTimelineEvent::MessageLike(e) => match e {
+                    AnyMessageLikeEvent::RoomMessage(e) => match e.as_original().unwrap().content.msgtype { // Add real handling for the case where the event is redacted
+
+                        _ => "[Placeholder message]",
+                    }
+                    _ => "[Placeholder message-like]",
+                },
+                AnyTimelineEvent::State(_e) => "[Placeholder state-like]",
+            };
             // Add real handling here; this is unreadable, right now
-            room_export.push_str(&format!("{:?}\n", event))
+            room_export.push_str(&format!("{}\n", event_stringified))
         }
         write(format!("{}.txt", format_export_filename(&room_to_export_info)), room_export).unwrap(); // Ideally let users pass format strings of some sort here
     }
