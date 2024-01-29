@@ -11,6 +11,7 @@ use matrix_sdk::{
     room::MessagesOptions,
     ruma::{
         events::{
+            room::message::MessageType,
             AnyMessageLikeEvent,
             AnyTimelineEvent,
         },
@@ -145,15 +146,24 @@ async fn export(config: Export, sessions_file: &SessionsFile) -> anyhow::Result<
         let messages = room_to_export_info.room.messages(MessagesOptions::forward()).await?; // Could async this better; try that at some point. Also, looks like for now this is going to get only the first 10 messages?
         let mut room_export = String::new();
         for event in messages.chunk {
-            let event_stringified = match event.event.deserialize().unwrap() { // Add real error-handling in place of this unwrap
+            let event_deserialized = event.event.deserialize().unwrap(); // Add real error-handling in place of this unwrap
+            let event_sender_id = event_deserialized.sender();
+            let event_sender_string_representation = match room_to_export_info.room.get_member_no_sync(event_sender_id).await? {
+                Some(room_member) => match room_member.display_name() {
+                    Some(display_name) => format!("{} ({})", display_name, event_sender_id),
+                    None => event_sender_id.to_string(),
+                }
+                None => event_sender_id.to_string(),
+            };
+            let event_stringified = match &event_deserialized {
                 AnyTimelineEvent::MessageLike(e) => match e {
-                    AnyMessageLikeEvent::RoomMessage(e) => match e.as_original().unwrap().content.msgtype { // Add real handling for the case where the event is redacted
-
-                        _ => "[Placeholder message]",
+                    AnyMessageLikeEvent::RoomMessage(e) => match &e.as_original().unwrap().content.msgtype { // Add real handling for the case where the event is redacted
+                        MessageType::Text(e) => format!("{}: {}", event_sender_string_representation, &e.body), // Add timestamps here, and also handling for formatted messages
+                        _ => String::from("[Placeholder message]"),
                     }
-                    _ => "[Placeholder message-like]",
+                    _ => String::from("[Placeholder message-like]"),
                 },
-                AnyTimelineEvent::State(_e) => "[Placeholder state-like]",
+                AnyTimelineEvent::State(_e) => String::from("[Placeholder state-like]"),
             };
             // Add real handling here; this is unreadable, right now
             room_export.push_str(&format!("{}\n", event_stringified))
