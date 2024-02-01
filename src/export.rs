@@ -84,7 +84,14 @@ pub async fn export(client: &Client, rooms: Vec<String>) -> anyhow::Result<()> {
         let messages = room_to_export_info.room.messages(messages_options).await?; // Could async this better between rooms-to-export; try that at some point. Also put this in a loop so I can get messages from rooms with over 1000 of the things.
         let mut room_export = String::new();
         for event in messages.chunk {
-            let event_deserialized = event.event.deserialize().unwrap(); // Add real error-handling in place of this unwrap
+            let event_deserialized = match event.event.deserialize() {
+                Ok(event_deserialized) => event_deserialized,
+                Err(_) => {
+                    // Add more nuanced error-handling here
+                    room_export.push_str("[Message skipped due to deserialization failure]\n");
+                    continue
+                }
+            };
             let event_timestamp_millis = event_deserialized.origin_server_ts().0.into();
             let event_timestamp_string_representation = DateTime::from_timestamp_millis(event_timestamp_millis).expect(&format!("Found message with millisecond timestamp {}, which can't be converted to datetime.", event_timestamp_millis)).to_rfc3339_opts(SecondsFormat::Millis, true); // Add real error-handling, and also an option to use local time zones
             let event_sender_id = event_deserialized.sender();
