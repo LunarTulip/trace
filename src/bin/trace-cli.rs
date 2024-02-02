@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{
     Path,
     PathBuf,
@@ -51,9 +52,9 @@ struct Export {
     #[argh(positional)]
     /// space-separated list of room IDs (of the form !abcdefghijklmnopqr:example.com), aliases (of the form #room:example.com), or display names (e.g. 'Example Room') to export
     rooms: Vec<String>,
-    #[argh(option, short = 'f', default = "String::from(\"txt\")")]
-    /// format to export to (options: 'json', 'txt'; default: txt)
-    format: String,
+    #[argh(option, short = 'f')]
+    /// format to export to; valid options are 'json' and 'txt'; flag can be used multiple times to export multiple formats in a single run; if flag is unspecified, default output format is json
+    formats: Vec<String>,
     #[argh(option, short = 'o')]
     /// path of directory to output files to
     output: Option<PathBuf>,
@@ -128,15 +129,22 @@ struct SessionRename {
 //////////////
 
 async fn export(config: Export, sessions_file: &SessionsFile) -> anyhow::Result<()> {
-    let export_format = match config.format.to_lowercase().as_ref() {
-        "json" | ".json" => ExportOutputFormat::Json,
-        "txt" | ".txt" => ExportOutputFormat::Txt,
-        _ => panic!("Received invalid format specifier {} on export command. Valid options are 'json' and 'txt'.", config.format), // Add real error-handling here. (It'd be nice if argh allowed more direct handling of this; track https://github.com/google/argh/issues/138 in case it eventually does.)
-    };
+    println!("{:?}", config.formats);
+    let mut export_formats = HashSet::new();
+    for format in config.formats {
+        match format.to_lowercase().as_ref() {
+            "json" | ".json" => export_formats.insert(ExportOutputFormat::Json),
+            "txt" | ".txt" => export_formats.insert(ExportOutputFormat::Txt),
+            _ => panic!("Received invalid format specifier {} on export command. Valid options are 'json' and 'txt'.", format), // Add real error-handling here. (It'd be nice if argh allowed more direct handling of this; track https://github.com/google/argh/issues/138 in case it eventually does.)
+        };
+    }
+    if export_formats.is_empty() {
+        export_formats.insert(ExportOutputFormat::Json);
+    }
 
     let client = nonfirst_login(&config.user_id, sessions_file).await?;
     client.sync_once(SyncSettings::new().set_presence(PresenceState::Offline)).await?;
-    trace::export(&client, config.rooms, config.output, export_format).await?;
+    trace::export(&client, config.rooms, config.output, export_formats).await?;
 
     Ok(())
 }

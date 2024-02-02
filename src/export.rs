@@ -1,4 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{
+    HashMap,
+    HashSet,
+};
 use std::fs::{
     create_dir_all,
     write,
@@ -26,6 +29,7 @@ use matrix_sdk::{
 //   Types   //
 ///////////////
 
+#[derive(PartialEq, Eq, Hash)]
 pub enum ExportOutputFormat {
     Json,
     Txt,
@@ -67,7 +71,7 @@ fn format_export_filename(room_info: &RoomWithCachedInfo) -> String {
     }
 }
 
-fn messages_to_json(events: Vec<TimelineEvent>) -> String {
+fn messages_to_json(events: &Vec<TimelineEvent>) -> String {
     // Possibly add more secondary-representations-of-events here, analogous to e.g. the display-name-retrieval and datetime-formatting and so forth in the txt output?
     // Also possibly some metadata analogous to what gets output at the head of DiscordChatExporter's JSON exports?
     let mut events_to_export = Vec::new();
@@ -80,7 +84,7 @@ fn messages_to_json(events: Vec<TimelineEvent>) -> String {
     serde_json::to_string_pretty(&events_to_export).unwrap()
 }
 
-async fn messages_to_txt(events: Vec<TimelineEvent>, room_info: &RoomWithCachedInfo) -> anyhow::Result<String> {
+async fn messages_to_txt(events: &Vec<TimelineEvent>, room_info: &RoomWithCachedInfo) -> anyhow::Result<String> {
     let mut user_ids_to_display_names: HashMap<String, Option<String>> = HashMap::new();
     let mut room_export = String::new();
 
@@ -138,8 +142,8 @@ async fn messages_to_txt(events: Vec<TimelineEvent>, room_info: &RoomWithCachedI
     Ok(room_export)
 }
 
-pub async fn export(client: &Client, rooms: Vec<String>, output_path: Option<PathBuf>, format: ExportOutputFormat) -> anyhow::Result<()> {
-    if let Some(ref path) = output_path {
+pub async fn export(client: &Client, rooms: Vec<String>, output_path: Option<PathBuf>, formats: HashSet<ExportOutputFormat>) -> anyhow::Result<()> {
+    if let Some(path) = output_path.as_ref() {
         if path.exists() {
             if !path.is_dir() {
                 // Add real error-handling here
@@ -173,7 +177,7 @@ pub async fn export(client: &Client, rooms: Vec<String>, output_path: Option<Pat
         loop {
             // Add emergency handling for rooms which are somehow presenting as infinitely long, to avoid slamming the server forever. (Analogous to Element's max 10 million messages.)
             let mut messages_options = MessagesOptions::forward().from(last_end_token.as_deref());
-            messages_options.limit = 1000u32.into();
+            messages_options.limit = 1000u16.into();
             let mut messages = room_to_export_info.room.messages(messages_options).await?;
             let messages_length = messages.chunk.len();
             events.append(&mut messages.chunk);
@@ -183,27 +187,21 @@ pub async fn export(client: &Client, rooms: Vec<String>, output_path: Option<Pat
                 last_end_token = messages.end;
             }
         }
-        
-        let output_file;
-        let output_file_extension;
-        match format {
-            // Ideally let users pass format strings of some sort here for the output filenames
-            ExportOutputFormat::Json => {
-                output_file = messages_to_json(events);
-                output_file_extension = "json";
-            }
-            ExportOutputFormat::Txt => {
-                output_file = messages_to_txt(events, room_to_export_info).await?;
-                output_file_extension = "txt";
-            }
-        };
 
-        let mut output_path_buf = PathBuf::new();
-        if let Some(ref path) = output_path {
-            output_path_buf.push(path);
+        let base_output_path = output_path.clone().unwrap_or_else(|| PathBuf::new());
+        let base_output_filename = format_export_filename(&room_to_export_info);
+        if formats.contains(&ExportOutputFormat::Json) {
+            let json_output_file = messages_to_json(&events);
+            let mut json_output_path_buf = base_output_path.clone();
+            json_output_path_buf.push(format!("{}.json", base_output_filename));
+            write(json_output_path_buf, json_output_file).unwrap();
         }
-        output_path_buf.push(format!("{}.{}", format_export_filename(&room_to_export_info), output_file_extension));
-        write(output_path_buf, output_file).unwrap();
+        if formats.contains(&ExportOutputFormat::Txt) {
+            let txt_output_file = messages_to_txt(&events, room_to_export_info).await?;
+            let mut txt_output_path_buf = base_output_path.clone();
+            txt_output_path_buf.push(format!("{}.txt", base_output_filename));
+            write(txt_output_path_buf, txt_output_file).unwrap();
+        }
     }
 
     Ok(())
