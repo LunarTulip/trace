@@ -129,7 +129,6 @@ struct SessionRename {
 //////////////
 
 async fn export(config: Export, sessions_file: &SessionsFile) -> anyhow::Result<()> {
-    println!("{:?}", config.formats);
     let mut export_formats = HashSet::new();
     for format in config.formats {
         match format.to_lowercase().as_ref() {

@@ -92,7 +92,7 @@ async fn messages_to_txt(events: &Vec<TimelineEvent>, room_info: &RoomWithCached
         let event_deserialized = match event.event.deserialize() {
             Ok(event_deserialized) => event_deserialized,
             Err(_) => {
-                // Add more nuanced error-handling here
+                // Add more nuanced error-handling here; it seems like a lot of these are in fact redacted messages, just weirdly-formed ones that don't deserialize right?
                 room_export.push_str("[Message skipped due to deserialization failure]\n");
                 continue
             }
@@ -130,7 +130,7 @@ async fn messages_to_txt(events: &Vec<TimelineEvent>, room_info: &RoomWithCached
                         MessageType::Text(e) => format!("[{}] {}: {}", event_timestamp_string_representation, event_sender_string_representation, &e.body),
                         _ => String::from("[Placeholder message]"),
                     }
-                    None => String::from("[Placeholder redacted message]"),
+                    None => format!("[{}] {}: [Redacted message]", event_timestamp_string_representation, event_sender_string_representation),
                 },
                 _ => String::from("[Placeholder message-like]"),
             },
