@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::write;
 
 use crate::{
@@ -7,10 +8,8 @@ use crate::{
 
 use chrono::{DateTime, SecondsFormat};
 use matrix_sdk::{
-    room::{
-        Messages,
-        MessagesOptions
-    },
+    deserialized_responses::TimelineEvent,
+    room::MessagesOptions,
     ruma::events::{
         room::message::MessageType,
         AnyMessageLikeEvent,
@@ -64,12 +63,12 @@ fn format_export_filename(room_info: &RoomWithCachedInfo) -> String {
     }
 }
 
-fn messages_to_json(messages: Messages) -> String {
+fn messages_to_json(events: Vec<TimelineEvent>) -> String {
     // Possibly add more secondary-representations-of-events here, analogous to e.g. the display-name-retrieval and datetime-formatting and so forth in the txt output?
     // Also possibly some metadata analogous to what gets output at the head of DiscordChatExporter's JSON exports?
     let mut events_to_export = Vec::new();
 
-    for event in messages.chunk {
+    for event in events {
         let event_serialized = event.event.deserialize_as::<serde_json::Value>().expect("Failed to deserialize a message to JSON value. (This is surprising.)"); // Add real error-handling here
         events_to_export.push(event_serialized);
     }
@@ -77,10 +76,11 @@ fn messages_to_json(messages: Messages) -> String {
     serde_json::to_string_pretty(&events_to_export).unwrap()
 }
 
-async fn messages_to_txt(messages: Messages, room_info: &RoomWithCachedInfo) -> anyhow::Result<String> {
+async fn messages_to_txt(events: Vec<TimelineEvent>, room_info: &RoomWithCachedInfo) -> anyhow::Result<String> {
+    let mut user_ids_to_display_names: HashMap<String, Option<String>> = HashMap::new();
     let mut room_export = String::new();
 
-    for event in messages.chunk {
+    for event in events {
         let event_deserialized = match event.event.deserialize() {
             Ok(event_deserialized) => event_deserialized,
             Err(_) => {
@@ -89,25 +89,41 @@ async fn messages_to_txt(messages: Messages, room_info: &RoomWithCachedInfo) -> 
                 continue
             }
         };
+
         let event_timestamp_millis = event_deserialized.origin_server_ts().0.into();
         let event_timestamp_string_representation = DateTime::from_timestamp_millis(event_timestamp_millis).expect(&format!("Found message with millisecond timestamp {}, which can't be converted to datetime.", event_timestamp_millis)).to_rfc3339_opts(SecondsFormat::Millis, true); // Add real error-handling, and also an option to use local time zones
+
         let event_sender_id = event_deserialized.sender();
-        let event_sender_string_representation = match room_info.room.get_member_no_sync(event_sender_id).await? {
-            Some(room_member) => match room_member.display_name() {
-                Some(display_name) => format!("{} ({})", display_name, event_sender_id),
-                None => event_sender_id.to_string(),
-            }
+        let event_sender_id_string = event_sender_id.to_string();
+        let event_sender_display_name = match user_ids_to_display_names.get(&event_sender_id_string) {
+            Some(display_name_option) => display_name_option,
+            None => &match room_info.room.get_member_no_sync(event_sender_id).await? {
+                Some(room_member) => {
+                    let display_name = room_member.display_name().map(|s| String::from(s));
+                    user_ids_to_display_names.insert(event_sender_id_string.clone(), display_name);
+                    user_ids_to_display_names.get(&event_sender_id_string).unwrap()
+                }
+                None => &None,
+            },
+        };
+        let event_sender_string_representation = match event_sender_display_name {
+            // Possibly factor this into the display-name-caching since this is the only place the raw name is used?
+            Some(display_name) => format!("{} ({})", display_name, event_sender_id_string),
             None => event_sender_id.to_string(),
         };
+
         let event_stringified = match &event_deserialized {
             AnyTimelineEvent::MessageLike(e) => match e {
-                AnyMessageLikeEvent::RoomMessage(e) => match &e.as_original().unwrap().content.msgtype { // Add real handling for the case where the event is redacted
-                    // Add handling for formatted messages
-                    MessageType::Emote(e) => format!("[{}] {}: *{}*", event_timestamp_string_representation, event_sender_string_representation, &e.body), // Think harder about whether asterisks are the correct representation here
-                    MessageType::Notice(e) => format!("[{}] {}: [{}]", event_timestamp_string_representation, event_sender_string_representation, &e.body), // Think harder about whether brackets are the correct representation here
-                    MessageType::Text(e) => format!("[{}] {}: {}", event_timestamp_string_representation, event_sender_string_representation, &e.body),
-                    _ => String::from("[Placeholder message]"),
-                }
+                AnyMessageLikeEvent::RoomMessage(e) => match &e.as_original() {
+                    Some(unredacted_room_message) => match &unredacted_room_message.content.msgtype {
+                        // Add handling for formatted messages
+                        MessageType::Emote(e) => format!("[{}] {}: *{}*", event_timestamp_string_representation, event_sender_string_representation, &e.body), // Think harder about whether asterisks are the correct representation here
+                        MessageType::Notice(e) => format!("[{}] {}: [{}]", event_timestamp_string_representation, event_sender_string_representation, &e.body), // Think harder about whether brackets are the correct representation here
+                        MessageType::Text(e) => format!("[{}] {}: {}", event_timestamp_string_representation, event_sender_string_representation, &e.body),
+                        _ => String::from("[Placeholder message]"),
+                    }
+                    None => String::from("[Placeholder redacted message]"),
+                },
                 _ => String::from("[Placeholder message-like]"),
             },
             AnyTimelineEvent::State(_e) => String::from("[Placeholder state-like]"),
@@ -137,17 +153,29 @@ pub async fn export(client: &Client, rooms: Vec<String>, format: ExportOutputFor
                 },
             }
         };
-        let mut messages_options = MessagesOptions::forward();
-        messages_options.limit = 1000u32.into();
-        let messages = room_to_export_info.room.messages(messages_options).await?; // Could async this better between rooms-to-export; try that at some point. Also put this in a loop so I can get messages from rooms with over 1000 of the things.
+        let mut events = Vec::new();
+        let mut last_end_token = None;
+        loop {
+            // Add emergency handling for rooms which are somehow presenting as infinitely long, to avoid slamming the server forever. (Analogous to Element's max 10 million messages.)
+            let mut messages_options = MessagesOptions::forward().from(last_end_token.as_deref());
+            messages_options.limit = 1000u32.into();
+            let mut messages = room_to_export_info.room.messages(messages_options).await?;
+            let messages_length = messages.chunk.len();
+            events.append(&mut messages.chunk);
+            if messages_length < 1000 {
+                break
+            } else {
+                last_end_token = messages.end;
+            }
+        }
         match format {
             // Ideally let users pass format strings of some sort here for the output files
             ExportOutputFormat::Json => {
-                let export_file = messages_to_json(messages);
+                let export_file = messages_to_json(events);
                 write(format!("{}.json", format_export_filename(&room_to_export_info)), export_file).unwrap();
             }
             ExportOutputFormat::Txt => {
-                let export_file = messages_to_txt(messages, room_to_export_info).await?;
+                let export_file = messages_to_txt(events, room_to_export_info).await?;
                 write(format!("{}.txt", format_export_filename(&room_to_export_info)), export_file).unwrap();
             }
         };
