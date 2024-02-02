@@ -1,4 +1,7 @@
-use std::path::Path;
+use std::path::{
+    Path,
+    PathBuf,
+};
 
 use trace::{
     ExportOutputFormat,
@@ -51,6 +54,9 @@ struct Export {
     #[argh(option, short = 'f', default = "String::from(\"txt\")")]
     /// format to export to (options: 'json', 'txt'; default: txt)
     format: String,
+    #[argh(option, short = 'o')]
+    /// path of directory to output files to
+    output: Option<PathBuf>,
 }
 
 #[derive(FromArgs)]
@@ -130,7 +136,7 @@ async fn export(config: Export, sessions_file: &SessionsFile) -> anyhow::Result<
 
     let client = nonfirst_login(&config.user_id, sessions_file).await?;
     client.sync_once(SyncSettings::new().set_presence(PresenceState::Offline)).await?;
-    trace::export(&client, config.rooms, export_format).await?;
+    trace::export(&client, config.rooms, config.output, export_format).await?;
 
     Ok(())
 }

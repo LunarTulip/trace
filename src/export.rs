@@ -1,5 +1,9 @@
 use std::collections::HashMap;
-use std::fs::write;
+use std::fs::{
+    create_dir_all,
+    write,
+};
+use std::path::PathBuf;
 
 use crate::{
     get_rooms_info,
@@ -134,8 +138,18 @@ async fn messages_to_txt(events: Vec<TimelineEvent>, room_info: &RoomWithCachedI
     Ok(room_export)
 }
 
-pub async fn export(client: &Client, rooms: Vec<String>, format: ExportOutputFormat) -> anyhow::Result<()> {
-    // Allow setting export destination other than "directly where run"
+pub async fn export(client: &Client, rooms: Vec<String>, output_path: Option<PathBuf>, format: ExportOutputFormat) -> anyhow::Result<()> {
+    if let Some(ref path) = output_path {
+        if path.exists() {
+            if !path.is_dir() {
+                // Add real error-handling here
+                panic!("Output path {} isn't a directory.", path.display());
+            }
+        } else {
+            create_dir_all(path).unwrap();
+        }
+    }
+
     let accessible_rooms_info = get_rooms_info(&client).await?; // This should be possible to optimize out for request-piles without names included, given client.resolve_room_alias and client.get_room. Although that might end up actually costlier if handled indelicately, since it'll involve more serial processing.
 
     for room_identifier in rooms {
@@ -153,6 +167,7 @@ pub async fn export(client: &Client, rooms: Vec<String>, format: ExportOutputFor
                 },
             }
         };
+
         let mut events = Vec::new();
         let mut last_end_token = None;
         loop {
@@ -168,17 +183,27 @@ pub async fn export(client: &Client, rooms: Vec<String>, format: ExportOutputFor
                 last_end_token = messages.end;
             }
         }
+        
+        let output_file;
+        let output_file_extension;
         match format {
-            // Ideally let users pass format strings of some sort here for the output files
+            // Ideally let users pass format strings of some sort here for the output filenames
             ExportOutputFormat::Json => {
-                let export_file = messages_to_json(events);
-                write(format!("{}.json", format_export_filename(&room_to_export_info)), export_file).unwrap();
+                output_file = messages_to_json(events);
+                output_file_extension = "json";
             }
             ExportOutputFormat::Txt => {
-                let export_file = messages_to_txt(events, room_to_export_info).await?;
-                write(format!("{}.txt", format_export_filename(&room_to_export_info)), export_file).unwrap();
+                output_file = messages_to_txt(events, room_to_export_info).await?;
+                output_file_extension = "txt";
             }
         };
+
+        let mut output_path_buf = PathBuf::new();
+        if let Some(ref path) = output_path {
+            output_path_buf.push(path);
+        }
+        output_path_buf.push(format!("{}.{}", format_export_filename(&room_to_export_info), output_file_extension));
+        write(output_path_buf, output_file).unwrap();
     }
 
     Ok(())
