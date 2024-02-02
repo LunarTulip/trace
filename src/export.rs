@@ -7,7 +7,10 @@ use crate::{
 
 use chrono::{DateTime, SecondsFormat};
 use matrix_sdk::{
-    room::MessagesOptions,
+    room::{
+        Messages,
+        MessagesOptions
+    },
     ruma::events::{
         room::message::MessageType,
         AnyMessageLikeEvent,
@@ -20,14 +23,19 @@ use matrix_sdk::{
 //   Types   //
 ///////////////
 
+pub enum ExportOutputFormat {
+    Json,
+    Txt,
+}
+
 enum RoomIndexRetrievalError {
     MultipleRoomsWithSpecifiedName(Vec<String>),
     NoRoomsWithSpecifiedName,
 }
 
-/////////////////
-//   Helpers   //
-/////////////////
+//////////////
+//   Main   //
+//////////////
 
 fn get_room_index_by_identifier(rooms_info: &Vec<RoomWithCachedInfo>, identifier: &str) -> Result<usize, RoomIndexRetrievalError> {
     if let Some(index) = rooms_info.iter().position(|room_info| &room_info.id == identifier) {
@@ -56,11 +64,61 @@ fn format_export_filename(room_info: &RoomWithCachedInfo) -> String {
     }
 }
 
-//////////////
-//   Main   //
-//////////////
+fn messages_to_json(messages: Messages) -> String {
+    // Possibly add more secondary-representations-of-events here, analogous to e.g. the display-name-retrieval and datetime-formatting and so forth in the txt output?
+    // Also possibly some metadata analogous to what gets output at the head of DiscordChatExporter's JSON exports?
+    let mut events_to_export = Vec::new();
 
-pub async fn export(client: &Client, rooms: Vec<String>) -> anyhow::Result<()> {
+    for event in messages.chunk {
+        let event_serialized = event.event.deserialize_as::<serde_json::Value>().expect("Failed to deserialize a message to JSON value. (This is surprising.)"); // Add real error-handling here
+        events_to_export.push(event_serialized);
+    }
+
+    serde_json::to_string_pretty(&events_to_export).unwrap()
+}
+
+async fn messages_to_txt(messages: Messages, room_info: &RoomWithCachedInfo) -> anyhow::Result<String> {
+    let mut room_export = String::new();
+
+    for event in messages.chunk {
+        let event_deserialized = match event.event.deserialize() {
+            Ok(event_deserialized) => event_deserialized,
+            Err(_) => {
+                // Add more nuanced error-handling here
+                room_export.push_str("[Message skipped due to deserialization failure]\n");
+                continue
+            }
+        };
+        let event_timestamp_millis = event_deserialized.origin_server_ts().0.into();
+        let event_timestamp_string_representation = DateTime::from_timestamp_millis(event_timestamp_millis).expect(&format!("Found message with millisecond timestamp {}, which can't be converted to datetime.", event_timestamp_millis)).to_rfc3339_opts(SecondsFormat::Millis, true); // Add real error-handling, and also an option to use local time zones
+        let event_sender_id = event_deserialized.sender();
+        let event_sender_string_representation = match room_info.room.get_member_no_sync(event_sender_id).await? {
+            Some(room_member) => match room_member.display_name() {
+                Some(display_name) => format!("{} ({})", display_name, event_sender_id),
+                None => event_sender_id.to_string(),
+            }
+            None => event_sender_id.to_string(),
+        };
+        let event_stringified = match &event_deserialized {
+            AnyTimelineEvent::MessageLike(e) => match e {
+                AnyMessageLikeEvent::RoomMessage(e) => match &e.as_original().unwrap().content.msgtype { // Add real handling for the case where the event is redacted
+                    // Add handling for formatted messages
+                    MessageType::Emote(e) => format!("[{}] {}: *{}*", event_timestamp_string_representation, event_sender_string_representation, &e.body), // Think harder about whether asterisks are the correct representation here
+                    MessageType::Notice(e) => format!("[{}] {}: [{}]", event_timestamp_string_representation, event_sender_string_representation, &e.body), // Think harder about whether brackets are the correct representation here
+                    MessageType::Text(e) => format!("[{}] {}: {}", event_timestamp_string_representation, event_sender_string_representation, &e.body),
+                    _ => String::from("[Placeholder message]"),
+                }
+                _ => String::from("[Placeholder message-like]"),
+            },
+            AnyTimelineEvent::State(_e) => String::from("[Placeholder state-like]"),
+        };
+        room_export.push_str(&format!("{}\n", event_stringified))
+    }
+
+    Ok(room_export)
+}
+
+pub async fn export(client: &Client, rooms: Vec<String>, format: ExportOutputFormat) -> anyhow::Result<()> {
     // Allow setting export destination other than "directly where run"
     let accessible_rooms_info = get_rooms_info(&client).await?; // This should be possible to optimize out for request-piles without names included, given client.resolve_room_alias and client.get_room. Although that might end up actually costlier if handled indelicately, since it'll involve more serial processing.
 
@@ -82,42 +140,17 @@ pub async fn export(client: &Client, rooms: Vec<String>) -> anyhow::Result<()> {
         let mut messages_options = MessagesOptions::forward();
         messages_options.limit = 1000u32.into();
         let messages = room_to_export_info.room.messages(messages_options).await?; // Could async this better between rooms-to-export; try that at some point. Also put this in a loop so I can get messages from rooms with over 1000 of the things.
-        let mut room_export = String::new();
-        for event in messages.chunk {
-            let event_deserialized = match event.event.deserialize() {
-                Ok(event_deserialized) => event_deserialized,
-                Err(_) => {
-                    // Add more nuanced error-handling here
-                    room_export.push_str("[Message skipped due to deserialization failure]\n");
-                    continue
-                }
-            };
-            let event_timestamp_millis = event_deserialized.origin_server_ts().0.into();
-            let event_timestamp_string_representation = DateTime::from_timestamp_millis(event_timestamp_millis).expect(&format!("Found message with millisecond timestamp {}, which can't be converted to datetime.", event_timestamp_millis)).to_rfc3339_opts(SecondsFormat::Millis, true); // Add real error-handling, and also an option to use local time zones
-            let event_sender_id = event_deserialized.sender();
-            let event_sender_string_representation = match room_to_export_info.room.get_member_no_sync(event_sender_id).await? {
-                Some(room_member) => match room_member.display_name() {
-                    Some(display_name) => format!("{} ({})", display_name, event_sender_id),
-                    None => event_sender_id.to_string(),
-                }
-                None => event_sender_id.to_string(),
-            };
-            let event_stringified = match &event_deserialized {
-                AnyTimelineEvent::MessageLike(e) => match e {
-                    AnyMessageLikeEvent::RoomMessage(e) => match &e.as_original().unwrap().content.msgtype { // Add real handling for the case where the event is redacted
-                        // Add handling for formatted messages
-                        MessageType::Emote(e) => format!("[{}] {}: *{}*", event_timestamp_string_representation, event_sender_string_representation, &e.body), // Think harder about whether asterisks are the correct representation here
-                        MessageType::Notice(e) => format!("[{}] {}: [{}]", event_timestamp_string_representation, event_sender_string_representation, &e.body), // Think harder about whether brackets are the correct representation here
-                        MessageType::Text(e) => format!("[{}] {}: {}", event_timestamp_string_representation, event_sender_string_representation, &e.body),
-                        _ => String::from("[Placeholder message]"),
-                    }
-                    _ => String::from("[Placeholder message-like]"),
-                },
-                AnyTimelineEvent::State(_e) => String::from("[Placeholder state-like]"),
-            };
-            room_export.push_str(&format!("{}\n", event_stringified))
-        }
-        write(format!("{}.txt", format_export_filename(&room_to_export_info)), room_export).unwrap(); // Ideally let users pass format strings of some sort here
+        match format {
+            // Ideally let users pass format strings of some sort here for the output files
+            ExportOutputFormat::Json => {
+                let export_file = messages_to_json(messages);
+                write(format!("{}.json", format_export_filename(&room_to_export_info)), export_file).unwrap();
+            }
+            ExportOutputFormat::Txt => {
+                let export_file = messages_to_txt(messages, room_to_export_info).await?;
+                write(format!("{}.txt", format_export_filename(&room_to_export_info)), export_file).unwrap();
+            }
+        };
     }
 
     Ok(())

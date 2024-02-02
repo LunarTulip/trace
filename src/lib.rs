@@ -8,8 +8,6 @@ use std::{
     path::PathBuf,
 };
 
-pub mod export;
-
 use futures::future::join_all;
 use matrix_sdk::{
     matrix_auth::{
@@ -31,11 +29,16 @@ use serde::{
 };
 use uuid::Uuid;
 
+pub mod export;
+
 ////////////////////
 //   Re-exports   //
 ////////////////////
 
-pub use export::export;
+pub use export::{
+    export,
+    ExportOutputFormat,
+};
 
 ///////////////////////
 //   Non-arg types   //

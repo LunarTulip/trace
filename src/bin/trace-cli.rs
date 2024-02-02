@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use trace::{
+    ExportOutputFormat,
     SessionsFile,
     add_at_to_user_id_if_applicable,
     nonfirst_login,
@@ -45,8 +46,11 @@ struct Export {
     /// user_id (of the form @alice:example.com) to export rooms accessible to
     user_id: String,
     #[argh(positional)]
-    /// space-separated list of room IDs (of the form !abcdefghijklmnopqr:example.com), aliases (of the form #room:example.com), or names to export
+    /// space-separated list of room IDs (of the form !abcdefghijklmnopqr:example.com), aliases (of the form #room:example.com), or display names (e.g. 'Example Room') to export
     rooms: Vec<String>,
+    #[argh(option, short = 'f', default = "String::from(\"txt\")")]
+    /// format to export to (options: 'json', 'txt'; default: txt)
+    format: String,
 }
 
 #[derive(FromArgs)]
@@ -118,9 +122,15 @@ struct SessionRename {
 //////////////
 
 async fn export(config: Export, sessions_file: &SessionsFile) -> anyhow::Result<()> {
+    let export_format = match config.format.to_lowercase().as_ref() {
+        "json" | ".json" => ExportOutputFormat::Json,
+        "txt" | ".txt" => ExportOutputFormat::Txt,
+        _ => panic!("Received invalid format specifier {} on export command. Valid options are 'json' and 'txt'.", config.format), // Add real error-handling here. (It'd be nice if argh allowed more direct handling of this; track https://github.com/google/argh/issues/138 in case it eventually does.)
+    };
+
     let client = nonfirst_login(&config.user_id, sessions_file).await?;
     client.sync_once(SyncSettings::new().set_presence(PresenceState::Offline)).await?;
-    trace::export(&client, config.rooms).await?;
+    trace::export(&client, config.rooms, export_format).await?;
 
     Ok(())
 }
