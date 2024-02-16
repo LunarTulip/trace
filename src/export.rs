@@ -17,10 +17,13 @@ use chrono::{DateTime, SecondsFormat};
 use matrix_sdk::{
     deserialized_responses::TimelineEvent,
     room::MessagesOptions,
-    ruma::events::{
-        room::message::MessageType,
-        AnyMessageLikeEvent,
-        AnyTimelineEvent,
+    ruma::{
+        events::{
+            room::message::MessageType,
+            AnyMessageLikeEvent,
+            AnyTimelineEvent,
+        },
+        UserId
     },
     Client,
 };
@@ -84,8 +87,29 @@ fn messages_to_json(events: &Vec<TimelineEvent>) -> String {
     serde_json::to_string_pretty(&events_to_export).unwrap()
 }
 
+async fn user_id_to_string_representation(user_ids_to_string_representations: &mut HashMap<String, String>, room_info: &RoomWithCachedInfo, event_sender_id: &UserId) -> anyhow::Result<String> {
+    let event_sender_id_string = event_sender_id.to_string();
+    match user_ids_to_string_representations.get(&event_sender_id_string) {
+        Some(string_representation) => Ok(string_representation.clone()),
+        None => match room_info.room.get_member_no_sync(event_sender_id).await? {
+            Some(room_member) => {
+                let string_representation = match room_member.display_name() {
+                    Some(display_name) => format!("{} ({})", display_name, event_sender_id_string),
+                    None => event_sender_id_string.clone(),
+                };
+                user_ids_to_string_representations.insert(event_sender_id_string.clone(), string_representation);
+                Ok(user_ids_to_string_representations.get(&event_sender_id_string).unwrap().clone())
+            }
+            None => {
+                user_ids_to_string_representations.insert(event_sender_id_string.clone(), event_sender_id_string.clone());
+                Ok(event_sender_id_string)
+            },
+        },
+    }
+}
+
 async fn messages_to_txt(events: &Vec<TimelineEvent>, room_info: &RoomWithCachedInfo) -> anyhow::Result<String> {
-    let mut user_ids_to_display_names: HashMap<String, Option<String>> = HashMap::new();
+    let mut user_ids_to_string_representations: HashMap<String, String> = HashMap::new();
     let mut room_export = String::new();
 
     for event in events {
@@ -102,35 +126,28 @@ async fn messages_to_txt(events: &Vec<TimelineEvent>, room_info: &RoomWithCached
         let event_timestamp_string_representation = DateTime::from_timestamp_millis(event_timestamp_millis).expect(&format!("Found message with millisecond timestamp {}, which can't be converted to datetime.", event_timestamp_millis)).to_rfc3339_opts(SecondsFormat::Millis, true); // Add real error-handling, and also an option to use local time zones
 
         let event_sender_id = event_deserialized.sender();
-        let event_sender_id_string = event_sender_id.to_string();
-        let event_sender_display_name = match user_ids_to_display_names.get(&event_sender_id_string) {
-            Some(display_name_option) => display_name_option,
-            None => &match room_info.room.get_member_no_sync(event_sender_id).await? {
-                Some(room_member) => {
-                    let display_name = room_member.display_name().map(|s| String::from(s));
-                    user_ids_to_display_names.insert(event_sender_id_string.clone(), display_name);
-                    user_ids_to_display_names.get(&event_sender_id_string).unwrap()
-                }
-                None => &None,
-            },
-        };
-        let event_sender_string_representation = match event_sender_display_name {
-            // Possibly factor this into the display-name-caching since this is the only place the raw name is used?
-            Some(display_name) => format!("{} ({})", display_name, event_sender_id_string),
-            None => event_sender_id.to_string(),
-        };
+        let event_sender_string_representation = user_id_to_string_representation(&mut user_ids_to_string_representations, room_info, event_sender_id).await?;
+
+        let event_prefix = format!("[{}] {}:", event_timestamp_string_representation, event_sender_string_representation);
 
         let event_stringified = match &event_deserialized {
             AnyTimelineEvent::MessageLike(e) => match e {
                 AnyMessageLikeEvent::RoomMessage(e) => match &e.as_original() {
                     Some(unredacted_room_message) => match &unredacted_room_message.content.msgtype {
-                        // Add handling for formatted messages
-                        MessageType::Emote(e) => format!("[{}] {}: *{}*", event_timestamp_string_representation, event_sender_string_representation, &e.body), // Think harder about whether asterisks are the correct representation here
-                        MessageType::Notice(e) => format!("[{}] {}: [{}]", event_timestamp_string_representation, event_sender_string_representation, &e.body), // Think harder about whether brackets are the correct representation here
-                        MessageType::Text(e) => format!("[{}] {}: {}", event_timestamp_string_representation, event_sender_string_representation, &e.body),
-                        _ => String::from("[Placeholder message]"),
+                        // Possibly revisit here at some point to add more detail beyond the body into various of these formats
+                        MessageType::Audio(e) => format!("{} [Audio; textual representation: {}]", event_prefix, &e.body),
+                        MessageType::Emote(e) => format!("{} *{}*", event_prefix, &e.body), // Think harder about whether asterisks are the correct representation here
+                        MessageType::File(e) => format!("{} [File; textual representation: {}]", event_prefix, &e.body), // In the longer term maybe include filename directly? But currently it seems like the textual representation is the main thing that's actually used to encode the filename
+                        MessageType::Image(e) => format!("{} [Image; textual representation: {}]", event_prefix, &e.body),
+                        MessageType::Location(e) => format!("{} [Location; geo URI: {}; textual representation: {}]", event_prefix, &e.geo_uri, &e.body),
+                        MessageType::Notice(e) => format!("{} [{}]", event_prefix, &e.body), // Think harder about whether brackets are the correct representation here
+                        MessageType::ServerNotice(e) => format!("{} [Server notice: {}]", event_prefix, &e.body),
+                        MessageType::Text(e) => format!("{} {}", event_prefix, &e.body),
+                        MessageType::Video(e) => format!("{} [Video; textual representation: {}]", event_prefix, &e.body),
+                        MessageType::VerificationRequest(e) => format!("{} [Verification request sent to {}]", event_prefix, user_id_to_string_representation(&mut user_ids_to_string_representations, room_info, &e.to).await?),
+                        _ => String::from("[Message of unrecognized type]"),
                     }
-                    None => format!("[{}] {}: [Redacted message]", event_timestamp_string_representation, event_sender_string_representation),
+                    None => format!("{} [Redacted message]", event_prefix),
                 },
                 _ => String::from("[Placeholder message-like]"),
             },
@@ -174,18 +191,18 @@ pub async fn export(client: &Client, rooms: Vec<String>, output_path: Option<Pat
 
         let mut events = Vec::new();
         let mut last_end_token = None;
+        let mut total_messages = 0;
         loop {
-            // Add emergency handling for rooms which are somehow presenting as infinitely long, to avoid slamming the server forever. (Analogous to Element's max 10 million messages.)
             let mut messages_options = MessagesOptions::forward().from(last_end_token.as_deref());
-            messages_options.limit = 1000u16.into();
+            messages_options.limit = 1_000_u16.into(); // On an initial test, this seems to be a server-side limit, at least on matrix.org. Worth setting higher just in case other servers are less limited?
             let mut messages = room_to_export_info.room.messages(messages_options).await?;
             let messages_length = messages.chunk.len();
-            events.append(&mut messages.chunk);
-            if messages_length < 1000 {
+            total_messages += messages_length;
+            if messages_length == 0 || total_messages > 10_000_000 {
                 break
-            } else {
-                last_end_token = messages.end;
             }
+            events.append(&mut messages.chunk);
+            last_end_token = messages.end;
         }
 
         let base_output_path = output_path.clone().unwrap_or_else(|| PathBuf::new());

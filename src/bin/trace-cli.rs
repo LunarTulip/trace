@@ -56,7 +56,7 @@ struct Export {
     /// format to export to; valid options are 'json' and 'txt'; flag can be used multiple times to export multiple formats in a single run; if flag is unspecified, default output format is json
     formats: Vec<String>,
     #[argh(option, short = 'o')]
-    /// path of directory to output files to
+    /// path of directory to output files to; if unspecified, defaults to current directory
     output: Option<PathBuf>,
 }
 
