@@ -141,9 +141,17 @@ async fn export(config: Export, sessions_file: &SessionsFile) -> anyhow::Result<
         export_formats.insert(ExportOutputFormat::Json);
     }
 
+    let export_room_count = config.rooms.len();
+    if export_room_count == 0 {
+        println!("Successfully exported 0 rooms. (This may not be what you meant to do.)");
+        return Ok(()); // Plausibly replace with an error once I've got real error-handling
+    }
+
     let client = nonfirst_login(&config.user_id, sessions_file).await?;
     client.sync_once(SyncSettings::new().set_presence(PresenceState::Offline)).await?;
     trace::export(&client, config.rooms, config.output, export_formats).await?;
+
+    println!("Successfully exported {} rooms.", export_room_count);
 
     Ok(())
 }
@@ -199,6 +207,8 @@ async fn session_login(config: SessionLogin, sessions_file: &mut SessionsFile) -
 
     trace::first_login(&client, sessions_file, &normalized_user_id, &password, config.session_name).await?;
 
+    println!("Successfully logged into account {}.", normalized_user_id);
+
     Ok(())
 }
 
@@ -206,12 +216,16 @@ async fn session_logout(config: SessionLogout, sessions_file: &mut SessionsFile)
     let client = nonfirst_login(&config.user_id, sessions_file).await?;
     trace::logout(&client, sessions_file).await?;
 
+    println!("Successfully logged out of account {}.", add_at_to_user_id_if_applicable(&config.user_id));
+
     Ok(())
 }
 
 async fn session_rename(config: SessionRename, sessions_file: &SessionsFile) -> anyhow::Result<()> {
     let client = nonfirst_login(&config.user_id, sessions_file).await?;
     trace::rename_session(&client, &config.session_name).await?;
+
+    println!("Successfully renamed account {}'s session to '{}'.", add_at_to_user_id_if_applicable(&config.user_id), config.session_name);
 
     Ok(())
 }
