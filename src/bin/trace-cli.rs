@@ -9,6 +9,7 @@ use trace::{
     SessionsFile,
     add_at_to_user_id_if_applicable,
     nonfirst_login,
+    user_id_to_crypto_store_path,
 };
 
 use argh::FromArgs;
@@ -214,7 +215,8 @@ async fn handle_verification_request(verification_request: VerificationRequest) 
 //   Main   //
 //////////////
 
-async fn export(config: Export, sessions_file: &SessionsFile, store_path: &Path) -> anyhow::Result<()> {
+async fn export(config: Export, sessions_file: &SessionsFile, dirs: &ProjectDirs) -> anyhow::Result<()> {
+    let store_path = PathBuf::from(dirs.data_local_dir()).join(user_id_to_crypto_store_path(&config.user_id));
     let mut export_formats = HashSet::new();
     for format in config.formats {
         match format.to_lowercase().as_ref() {
@@ -233,7 +235,7 @@ async fn export(config: Export, sessions_file: &SessionsFile, store_path: &Path)
         return Ok(()); // Plausibly replace with an error once I've got real error-handling
     }
 
-    let client = nonfirst_login(&config.user_id, sessions_file, store_path).await?;
+    let client = nonfirst_login(&config.user_id, sessions_file, &store_path).await?;
     client.sync_once(SyncSettings::new().set_presence(PresenceState::Offline)).await?;
     trace::export(&client, config.rooms, config.output, export_formats).await?;
 
@@ -242,9 +244,10 @@ async fn export(config: Export, sessions_file: &SessionsFile, store_path: &Path)
     Ok(())
 }
 
-async fn list_rooms(config: ListRooms, sessions_file: &SessionsFile, store_path: &Path) -> anyhow::Result<()> {
+async fn list_rooms(config: ListRooms, sessions_file: &SessionsFile, dirs: &ProjectDirs) -> anyhow::Result<()> {
+    let store_path = PathBuf::from(dirs.data_local_dir()).join(user_id_to_crypto_store_path(&config.user_id));
     let normalized_user_id = add_at_to_user_id_if_applicable(&config.user_id);
-    let client = nonfirst_login(&normalized_user_id, sessions_file, store_path).await?;
+    let client = nonfirst_login(&normalized_user_id, sessions_file, &store_path).await?;
     client.sync_once(SyncSettings::new().set_presence(PresenceState::Offline)).await?;
 
     let rooms_info = trace::get_rooms_info(&client).await?;
@@ -265,8 +268,8 @@ async fn list_rooms(config: ListRooms, sessions_file: &SessionsFile, store_path:
     Ok(())
 }
 
-async fn session_list(sessions_file: &SessionsFile, store_path: &Path) -> anyhow::Result<()> {
-    let sessions = trace::list_sessions(sessions_file, store_path).await?;
+async fn session_list(sessions_file: &SessionsFile, dirs: &ProjectDirs) -> anyhow::Result<()> {
+    let sessions = trace::list_sessions(sessions_file, dirs).await?;
     if sessions.len() > 0 {
         println!("Currently-logged-in sessions:");
         for (user_id, session_name) in sessions {
@@ -279,7 +282,8 @@ async fn session_list(sessions_file: &SessionsFile, store_path: &Path) -> anyhow
     Ok(())
 }
 
-async fn session_login(config: SessionLogin, sessions_file: &mut SessionsFile, store_path: &Path) -> anyhow::Result<()> {
+async fn session_login(config: SessionLogin, sessions_file: &mut SessionsFile, dirs: &ProjectDirs) -> anyhow::Result<()> {
+    let store_path = PathBuf::from(dirs.data_local_dir()).join(user_id_to_crypto_store_path(&config.user_id));
     let normalized_user_id = add_at_to_user_id_if_applicable(&config.user_id);
     if let Ok(_) = sessions_file.get(&normalized_user_id) {
         panic!("Tried to log into account {}, but you already have a session logged into this account.", &normalized_user_id); // Replace this with real error-handling.
@@ -299,28 +303,31 @@ async fn session_login(config: SessionLogin, sessions_file: &mut SessionsFile, s
     Ok(())
 }
 
-async fn session_logout(config: SessionLogout, sessions_file: &mut SessionsFile, store_path: &Path) -> anyhow::Result<()> {
-    match nonfirst_login(&config.user_id, sessions_file, store_path).await {
-        Ok(client) => match trace::logout_full(&client, sessions_file).await {
-            Ok(_) => println!("Successfully logged out of account {}.", add_at_to_user_id_if_applicable(&config.user_id)),
-            Err(_) => {
-                println!("Couldn't connect client. Logging out locally only.");
-                trace::logout_local(&config.user_id, sessions_file);
-                println!("Logged out of account {} locally. You may want to double-check your sessions list in case your session is still logged in on the server, in which case you'll need to clear it using a different client.", add_at_to_user_id_if_applicable(&config.user_id));
-            }
+async fn session_logout(config: SessionLogout, sessions_file: &mut SessionsFile, dirs: &ProjectDirs) -> anyhow::Result<()> {
+    let store_path = PathBuf::from(dirs.data_local_dir()).join(user_id_to_crypto_store_path(&config.user_id));
+    let normalized_user_id = add_at_to_user_id_if_applicable(&config.user_id);
+
+    let mut successful_remote_logout = false;
+    match nonfirst_login(&config.user_id, sessions_file, &store_path).await {
+        Ok(client) => match client.matrix_auth().logout().await {
+            Ok(_) => successful_remote_logout = true,
+            Err(e) => println!("Couldn't log out cilent from server due to error '{}'. Logging out on client side only. You may want to double-check your sessions list in case your session is still logged in on the server, in which case you'll need to clear it using a different client.", e),
         },
-        Err(_) => {
-            println!("Couldn't connect cilent. Logging out locally only.");
-            trace::logout_local(&config.user_id, sessions_file);
-            println!("Logged out of account {} locally. You may want to double-check your sessions list in case your session is still logged in on the server, in which case you'll need to clear it using a different client.", add_at_to_user_id_if_applicable(&config.user_id));
-        }
+        Err(e) => println!("Couldn't connect cilent to server due to error '{}'. Logging out on client side only. You may want to double-check your sessions list in case your session is still logged in on the server, in which case you'll need to clear it using a different client.", e),
+    }
+    trace::logout_local(&config.user_id, sessions_file, &store_path)?;
+    if successful_remote_logout {
+        println!("Successfully logged out of account {}.", normalized_user_id);
+    } else {
+        println!("Successfully logged out of account {} on the client side.", normalized_user_id);
     }
 
     Ok(())
 }
 
-async fn session_rename(config: SessionRename, sessions_file: &SessionsFile, store_path: &Path) -> anyhow::Result<()> {
-    let client = nonfirst_login(&config.user_id, sessions_file, store_path).await?;
+async fn session_rename(config: SessionRename, sessions_file: &SessionsFile, dirs: &ProjectDirs) -> anyhow::Result<()> {
+    let store_path = PathBuf::from(dirs.data_local_dir()).join(user_id_to_crypto_store_path(&config.user_id));
+    let client = nonfirst_login(&config.user_id, sessions_file, &store_path).await?;
     trace::rename_session(&client, &config.session_name).await?;
 
     println!("Successfully renamed account {}'s session to '{}'.", add_at_to_user_id_if_applicable(&config.user_id), config.session_name);
@@ -328,10 +335,11 @@ async fn session_rename(config: SessionRename, sessions_file: &SessionsFile, sto
     Ok(())
 }
 
-async fn session_verify(config: SessionVerify, sessions_file: &SessionsFile, store_path: &Path) -> anyhow::Result<()> {
+async fn session_verify(config: SessionVerify, sessions_file: &SessionsFile, dirs: &ProjectDirs) -> anyhow::Result<()> {
     println!("Warning: verification, although technically implemented, is currently a mess. You will need to manually ctrl-c out of the verification flow once finished.");
     // Add a branch for if no incoming verification request is captured in the sync, to produce an outgoing one.
-    let client = nonfirst_login(&config.user_id, sessions_file, store_path).await?;
+    let store_path = PathBuf::from(dirs.data_local_dir()).join(user_id_to_crypto_store_path(&config.user_id));
+    let client = nonfirst_login(&config.user_id, sessions_file, &store_path).await?;
     let encryption = client.encryption();
     client.add_event_handler(|event: ToDeviceKeyVerificationRequestEvent| async move {
         let user_id = event.sender;
@@ -353,18 +361,17 @@ async fn session_verify(config: SessionVerify, sessions_file: &SessionsFile, sto
 async fn main() -> anyhow::Result<()> {
     let dirs = ProjectDirs::from("", "", "Trace").unwrap(); // Figure out qualifier and organization
     let mut sessions_file = SessionsFile::open([dirs.data_local_dir(), Path::new("sessions.json")].iter().collect());
-    let store_path = dirs.data_local_dir();
 
     let args: Args = argh::from_env();
     match args.subcommand {
-        RootSubcommand::Export(config) => export(config, &sessions_file, store_path).await?,
-        RootSubcommand::ListRooms(config) => list_rooms(config, &sessions_file, store_path).await?,
+        RootSubcommand::Export(config) => export(config, &sessions_file, &dirs).await?,
+        RootSubcommand::ListRooms(config) => list_rooms(config, &sessions_file, &dirs).await?,
         RootSubcommand::Session(s) => match s.subcommand {
-            SessionSubcommand::List(_) => session_list(&sessions_file, store_path).await?,
-            SessionSubcommand::Login(config) => session_login(config, &mut sessions_file, store_path).await?,
-            SessionSubcommand::Logout(config) => session_logout(config, &mut sessions_file, store_path).await?,
-            SessionSubcommand::Rename(config) => session_rename(config, &sessions_file, store_path).await?,
-            SessionSubcommand::Verify(config) => session_verify(config, &sessions_file, store_path).await?,
+            SessionSubcommand::List(_) => session_list(&sessions_file, &dirs).await?,
+            SessionSubcommand::Login(config) => session_login(config, &mut sessions_file, &dirs).await?,
+            SessionSubcommand::Logout(config) => session_logout(config, &mut sessions_file, &dirs).await?,
+            SessionSubcommand::Rename(config) => session_rename(config, &sessions_file, &dirs).await?,
+            SessionSubcommand::Verify(config) => session_verify(config, &sessions_file, &dirs).await?,
         }
     };
 

@@ -3,6 +3,7 @@ use std::{
     fs::{
         create_dir_all,
         read_to_string,
+        remove_dir_all,
         write,
     },
     path::{
@@ -11,6 +12,7 @@ use std::{
     },
 };
 
+use directories::ProjectDirs;
 use futures::future::join_all;
 use matrix_sdk::{
     config::SyncSettings,
@@ -135,6 +137,20 @@ pub fn add_at_to_user_id_if_applicable(user_id: &str) -> String {
     }
 }
 
+pub fn user_id_to_crypto_store_path(user_id: &str) -> PathBuf {
+    let atless_user_id = if user_id.starts_with('@') {
+        user_id.chars().skip(1).collect()
+    } else {
+        String::from(user_id)
+    };
+
+    let mut store_path = PathBuf::new();
+    for component in atless_user_id.split(':').rev() {
+        store_path.push(component);
+    }
+    store_path
+}
+
 pub async fn nonfirst_login(user_id: &str, sessions_file: &SessionsFile, store_path: &Path) -> anyhow::Result<Client> {
     let normalized_user_id = add_at_to_user_id_if_applicable(user_id);
     let session = sessions_file.get(&normalized_user_id).unwrap();
@@ -189,21 +205,33 @@ pub async fn first_login(client: &Client, sessions_file: &mut SessionsFile, user
     Ok(())
 }
 
-pub async fn logout_full(client: &Client, sessions_file: &mut SessionsFile) -> anyhow::Result<()> {
+pub async fn logout_full(client: &Client, sessions_file: &mut SessionsFile, store_path: &Path) -> anyhow::Result<()> {
     client.matrix_auth().logout().await?;
+    remove_dir_all(store_path)?;
+    let store_path_parent = store_path.parent().unwrap();
+    if let None = store_path_parent.read_dir()?.next() {
+        remove_dir_all(store_path_parent)?;
+    }
     sessions_file.delete_session(&client.user_id().unwrap().to_string()).unwrap();
-    // Delete the crypto store files so 
 
     Ok(())
 }
 
-pub fn logout_local(user_id: &str, sessions_file: &mut SessionsFile) {
+pub fn logout_local(user_id: &str, sessions_file: &mut SessionsFile, store_path: &Path) -> anyhow::Result<()> {
+    remove_dir_all(store_path)?;
+    let store_path_parent = store_path.parent().unwrap();
+    if let None = store_path_parent.read_dir()?.next() {
+        remove_dir_all(store_path_parent)?;
+    }
     sessions_file.delete_session(user_id).unwrap();
+
+    Ok(())
 }
 
-pub async fn list_sessions(sessions_file: &SessionsFile, store_path: &Path) -> anyhow::Result<Vec<(String, String)>> {
+pub async fn list_sessions(sessions_file: &SessionsFile, dirs: &ProjectDirs) -> anyhow::Result<Vec<(String, String)>> {
     let mut sessions_info = join_all(sessions_file.sessions.iter().map(|session| async {
-        let client = nonfirst_login(&session.user_id, sessions_file, store_path).await?;
+        let store_path = PathBuf::from(dirs.data_local_dir()).join(user_id_to_crypto_store_path(&session.user_id));
+        let client = nonfirst_login(&session.user_id, sessions_file, &store_path).await?;
         let device_list = client.devices().await?.devices;
         let device_name = device_list.into_iter().find(|device| device.device_id == session.device_id).unwrap().display_name.unwrap_or_else(|| String::from("[Unnamed]"));
         anyhow::Result::<(String, String)>::Ok((session.user_id.clone(), device_name))
