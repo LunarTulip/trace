@@ -300,10 +300,21 @@ async fn session_login(config: SessionLogin, sessions_file: &mut SessionsFile, s
 }
 
 async fn session_logout(config: SessionLogout, sessions_file: &mut SessionsFile, store_path: &Path) -> anyhow::Result<()> {
-    let client = nonfirst_login(&config.user_id, sessions_file, store_path).await?;
-    trace::logout(&client, sessions_file).await?;
-
-    println!("Successfully logged out of account {}.", add_at_to_user_id_if_applicable(&config.user_id));
+    match nonfirst_login(&config.user_id, sessions_file, store_path).await {
+        Ok(client) => match trace::logout_full(&client, sessions_file).await {
+            Ok(_) => println!("Successfully logged out of account {}.", add_at_to_user_id_if_applicable(&config.user_id)),
+            Err(_) => {
+                println!("Couldn't connect client. Logging out locally only.");
+                trace::logout_local(&config.user_id, sessions_file);
+                println!("Logged out of account {} locally. You may want to double-check your sessions list in case your session is still logged in on the server, in which case you'll need to clear it using a different client.", add_at_to_user_id_if_applicable(&config.user_id));
+            }
+        },
+        Err(_) => {
+            println!("Couldn't connect cilent. Logging out locally only.");
+            trace::logout_local(&config.user_id, sessions_file);
+            println!("Logged out of account {} locally. You may want to double-check your sessions list in case your session is still logged in on the server, in which case you'll need to clear it using a different client.", add_at_to_user_id_if_applicable(&config.user_id));
+        }
+    }
 
     Ok(())
 }

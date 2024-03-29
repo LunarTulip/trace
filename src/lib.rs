@@ -155,9 +155,9 @@ pub async fn nonfirst_login(user_id: &str, sessions_file: &SessionsFile, store_p
     Ok(client)
 }
 
-//////////////////////////
-//   Shared functions   //
-//////////////////////////
+///////////////////////////////
+//   Shared core functions   //
+///////////////////////////////
 
 pub async fn first_login(client: &Client, sessions_file: &mut SessionsFile, user_id: &str, password: &str, session_name: Option<String>) -> anyhow::Result<()> {
     let deoptionalized_session_name = match session_name {
@@ -189,12 +189,16 @@ pub async fn first_login(client: &Client, sessions_file: &mut SessionsFile, user
     Ok(())
 }
 
-pub async fn logout(client: &Client, sessions_file: &mut SessionsFile) -> anyhow::Result<()> {
+pub async fn logout_full(client: &Client, sessions_file: &mut SessionsFile) -> anyhow::Result<()> {
     client.matrix_auth().logout().await?;
     sessions_file.delete_session(&client.user_id().unwrap().to_string()).unwrap();
     // Delete the crypto store files so 
 
     Ok(())
+}
+
+pub fn logout_local(user_id: &str, sessions_file: &mut SessionsFile) {
+    sessions_file.delete_session(user_id).unwrap();
 }
 
 pub async fn list_sessions(sessions_file: &SessionsFile, store_path: &Path) -> anyhow::Result<Vec<(String, String)>> {
