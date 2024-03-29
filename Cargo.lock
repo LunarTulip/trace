@@ -106,9 +106,9 @@ checksum = "d301b3b94cb4b2f23d7917810addbbaff90738e0ca2be692bd027e70d7e0330c"
 
 [[package]]
 name = "aquamarine"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "074b80d14d0240b6ce94d68f059a2d26a5d77280ae142662365a21ef6e2594ef"
+checksum = "21cc1548309245035eb18aa7f0967da6bc65587005170c56e6ef2788a4cf3f4e"
 dependencies = [
  "include_dir",
  "itertools 0.10.5",
@@ -1332,6 +1332,7 @@ version = "0.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf4e226dcd58b4be396f7bd3c20da8fdee2911400705297ba7d2d7cc2c30f716"
 dependencies = [
+ "cc",
  "pkg-config",
  "vcpkg",
 ]
@@ -1436,9 +1437,9 @@ dependencies = [
 
 [[package]]
 name = "matrix-sdk"
-version = "0.7.0"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8032c48789fe4c6d344b988e6dd6bab3f88b765dfae759dc720de3910272bc1"
+checksum = "336687e5fc8b33661a31681e988a67e9a3090c7fb1a8323a7f71eeaabad642ec"
 dependencies = [
  "anymap2",
  "aquamarine",
@@ -2582,6 +2583,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "text_io"
+version = "0.1.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d5f0c8eb2ad70c12a6a69508f499b3051c924f4b1cfeae85bfad96e6bc5bba46"
+
+[[package]]
 name = "thiserror"
 version = "1.0.52"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2767,6 +2774,7 @@ dependencies = [
  "rpassword",
  "serde",
  "serde_json",
+ "text_io",
  "tokio",
  "uuid",
 ]

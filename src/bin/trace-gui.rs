@@ -1,4 +1,3 @@
 fn main() {
-    // Todo
-    ()
+    println!("Trace GUI not yet implemented.")
 }

@@ -5,16 +5,22 @@ use std::{
         read_to_string,
         write,
     },
-    path::PathBuf,
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 use futures::future::join_all;
 use matrix_sdk::{
+    config::SyncSettings,
     matrix_auth::{
         MatrixSession,
         MatrixSessionTokens,
     }, 
     ruma::{
+        api::client::session::get_login_types::v3::LoginType,
+        presence::PresenceState,
         OwnedRoomAliasId,
         OwnedRoomId,
         UserId,
@@ -129,11 +135,11 @@ pub fn add_at_to_user_id_if_applicable(user_id: &str) -> String {
     }
 }
 
-pub async fn nonfirst_login(user_id: &str, sessions_file: &SessionsFile) -> anyhow::Result<Client> {
+pub async fn nonfirst_login(user_id: &str, sessions_file: &SessionsFile, store_path: &Path) -> anyhow::Result<Client> {
     let normalized_user_id = add_at_to_user_id_if_applicable(user_id);
     let session = sessions_file.get(&normalized_user_id).unwrap();
     let user = UserId::parse(&session.user_id)?;
-    let client = Client::builder().server_name(user.server_name()).build().await?;
+    let client = Client::builder().server_name(user.server_name()).sqlite_store(store_path, None).build().await?;
     client.matrix_auth().restore_session(MatrixSession {
         meta: SessionMeta {
             user_id: user,
@@ -144,6 +150,7 @@ pub async fn nonfirst_login(user_id: &str, sessions_file: &SessionsFile) -> anyh
             refresh_token: session.refresh_token,
         }
     }).await?;
+    client.encryption().wait_for_e2ee_initialization_tasks().await;
 
     Ok(client)
 }
@@ -153,13 +160,21 @@ pub async fn nonfirst_login(user_id: &str, sessions_file: &SessionsFile) -> anyh
 //////////////////////////
 
 pub async fn first_login(client: &Client, sessions_file: &mut SessionsFile, user_id: &str, password: &str, session_name: Option<String>) -> anyhow::Result<()> {
-    let session_name = match session_name {
+    let deoptionalized_session_name = match session_name {
         Some(name) => name,
         None => format!("Trace (Session UUID: {})", Uuid::new_v4())
     };
 
-    let login_result = client.matrix_auth().login_username(user_id, password).initial_device_display_name(&session_name).send().await?;
-    // Add a branch with SSO support, once I know how that's supposed to work
+    let auth = client.matrix_auth();
+    let supported_login_types = auth.get_login_types().await?.flows;
+    let login_result = if supported_login_types.iter().any(|login_type| match login_type {
+        LoginType::Password(_) => true,
+        _ => false,
+    }) {
+        auth.login_username(user_id, password).initial_device_display_name(&deoptionalized_session_name).send().await?
+    } else {
+        panic!("Attempted login to a server which lacks password-based login support. (SSO support will be added eventually.)");
+    };
 
     sessions_file.new_session(Session {
         user_id: login_result.user_id.to_string(),
@@ -168,19 +183,23 @@ pub async fn first_login(client: &Client, sessions_file: &mut SessionsFile, user
         refresh_token: login_result.refresh_token,
     }).unwrap();
 
+    client.encryption().wait_for_e2ee_initialization_tasks().await;
+    client.sync_once(SyncSettings::new().set_presence(PresenceState::Offline)).await?;
+
     Ok(())
 }
 
 pub async fn logout(client: &Client, sessions_file: &mut SessionsFile) -> anyhow::Result<()> {
     client.matrix_auth().logout().await?;
     sessions_file.delete_session(&client.user_id().unwrap().to_string()).unwrap();
+    // Delete the crypto store files so 
 
     Ok(())
 }
 
-pub async fn list_sessions(sessions_file: &SessionsFile) -> anyhow::Result<Vec<(String, String)>> {
+pub async fn list_sessions(sessions_file: &SessionsFile, store_path: &Path) -> anyhow::Result<Vec<(String, String)>> {
     let mut sessions_info = join_all(sessions_file.sessions.iter().map(|session| async {
-        let client = nonfirst_login(&session.user_id, sessions_file).await?;
+        let client = nonfirst_login(&session.user_id, sessions_file, store_path).await?;
         let device_list = client.devices().await?.devices;
         let device_name = device_list.into_iter().find(|device| device.device_id == session.device_id).unwrap().display_name.unwrap_or_else(|| String::from("[Unnamed]"));
         anyhow::Result::<(String, String)>::Ok((session.user_id.clone(), device_name))

@@ -13,9 +13,21 @@ use trace::{
 
 use argh::FromArgs;
 use directories::ProjectDirs;
+use futures::StreamExt;
 use matrix_sdk::{
     config::SyncSettings,
+    encryption::verification::{
+        AcceptSettings,
+        SasState,
+        Verification,
+        VerificationRequest,
+        VerificationRequestState,
+    },
     ruma::{
+        events::key::verification::{
+            request::ToDeviceKeyVerificationRequestEvent,
+            ShortAuthenticationString,
+        },
         presence::PresenceState,
         UserId,
     },
@@ -84,6 +96,7 @@ enum SessionSubcommand {
     Login(SessionLogin),
     Logout(SessionLogout),
     Rename(SessionRename),
+    Verify(SessionVerify),
 }
 
 #[derive(FromArgs)]
@@ -124,11 +137,84 @@ struct SessionRename {
     session_name: String,
 }
 
+#[derive(FromArgs)]
+#[argh(subcommand, name = "verify")]
+/// Verify a logged-in session for purposes of E2E encryption
+struct SessionVerify {
+    #[argh(positional)]
+    /// user id (of the form @alice:example.com) to verify your session with
+    user_id: String,
+}
+
+/////////////////
+//   Helpers   //
+/////////////////
+
+async fn handle_verification_request(verification_request: VerificationRequest) -> anyhow::Result<()> {
+    verification_request.accept().await?;
+    let mut verification_state_stream = verification_request.changes();
+    while let Some(state) = verification_state_stream.next().await {
+        match state {
+            VerificationRequestState::Transitioned { verification } => {
+                if let Verification::SasV1(sas_verification) = verification {
+                    sas_verification.accept_with_settings(AcceptSettings::with_allowed_methods(vec![ShortAuthenticationString::Decimal])).await?;
+                    let mut sas_verification_state_stream = sas_verification.changes();
+                    while let Some(state) = sas_verification_state_stream.next().await {
+                        match state {
+                            SasState::KeysExchanged {decimals, ..} => {
+                                println!("Attempting verification. SAS decimals: {}, {}, {}", decimals.0, decimals.1, decimals.2);
+                                println!("Do these decimals match those shown on the other side of the verification? (Y)es/(N)o/(C)ancel");
+                                loop {
+                                    let input: String = text_io::read!();
+                                    match input.trim().to_ascii_lowercase().as_ref() {
+                                        "y" | "yes" => {
+                                            sas_verification.confirm().await?;
+                                            println!("Verified.");
+                                            // Add checking to ensure verification succeeds on the remote end as well before breaking
+                                            break
+                                        }
+                                        "n" | "no" => {
+                                            sas_verification.mismatch().await?;
+                                            println!("Verification failed due to string mismatch.");
+                                            break
+                                        }
+                                        "c" | "cancel" => {
+                                            sas_verification.cancel().await?;
+                                            println!("Canceled verification attempt.");
+                                            break
+                                        }
+                                        _ => println!("Input '{}' not recognized. Please try again.", input),
+                                    }
+                                }
+
+                            }
+                            _ =>(),
+                        }
+                    }
+                } else {
+                    println!("Received verification attempt of type other than SAS V1. Trace CLI can't handle QR code verification, and Trace's developers are unaware of any verification types aside from SAS V1 and QR, so this verification attempt has been aborted.");
+                }
+            }
+            VerificationRequestState::Cancelled(info) => {
+                println!("Verification cancelled. Cancel info: {:?}", info);
+                break
+            }
+            VerificationRequestState::Done => {
+                println!("Verification done.");
+                break
+            }
+            _ => (),
+        }
+    }
+
+    Ok(())
+}
+
 //////////////
 //   Main   //
 //////////////
 
-async fn export(config: Export, sessions_file: &SessionsFile) -> anyhow::Result<()> {
+async fn export(config: Export, sessions_file: &SessionsFile, store_path: &Path) -> anyhow::Result<()> {
     let mut export_formats = HashSet::new();
     for format in config.formats {
         match format.to_lowercase().as_ref() {
@@ -147,7 +233,7 @@ async fn export(config: Export, sessions_file: &SessionsFile) -> anyhow::Result<
         return Ok(()); // Plausibly replace with an error once I've got real error-handling
     }
 
-    let client = nonfirst_login(&config.user_id, sessions_file).await?;
+    let client = nonfirst_login(&config.user_id, sessions_file, store_path).await?;
     client.sync_once(SyncSettings::new().set_presence(PresenceState::Offline)).await?;
     trace::export(&client, config.rooms, config.output, export_formats).await?;
 
@@ -156,9 +242,9 @@ async fn export(config: Export, sessions_file: &SessionsFile) -> anyhow::Result<
     Ok(())
 }
 
-async fn list_rooms(config: ListRooms, sessions_file: &SessionsFile) -> anyhow::Result<()> {
+async fn list_rooms(config: ListRooms, sessions_file: &SessionsFile, store_path: &Path) -> anyhow::Result<()> {
     let normalized_user_id = add_at_to_user_id_if_applicable(&config.user_id);
-    let client = nonfirst_login(&normalized_user_id, sessions_file).await?;
+    let client = nonfirst_login(&normalized_user_id, sessions_file, store_path).await?;
     client.sync_once(SyncSettings::new().set_presence(PresenceState::Offline)).await?;
 
     let rooms_info = trace::get_rooms_info(&client).await?;
@@ -179,8 +265,8 @@ async fn list_rooms(config: ListRooms, sessions_file: &SessionsFile) -> anyhow::
     Ok(())
 }
 
-async fn session_list(sessions_file: &SessionsFile) -> anyhow::Result<()> {
-    let sessions = trace::list_sessions(sessions_file).await?;
+async fn session_list(sessions_file: &SessionsFile, store_path: &Path) -> anyhow::Result<()> {
+    let sessions = trace::list_sessions(sessions_file, store_path).await?;
     if sessions.len() > 0 {
         println!("Currently-logged-in sessions:");
         for (user_id, session_name) in sessions {
@@ -193,7 +279,7 @@ async fn session_list(sessions_file: &SessionsFile) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn session_login(config: SessionLogin, sessions_file: &mut SessionsFile) -> anyhow::Result<()> {
+async fn session_login(config: SessionLogin, sessions_file: &mut SessionsFile, store_path: &Path) -> anyhow::Result<()> {
     let normalized_user_id = add_at_to_user_id_if_applicable(&config.user_id);
     if let Ok(_) = sessions_file.get(&normalized_user_id) {
         panic!("Tried to log into account {}, but you already have a session logged into this account.", &normalized_user_id); // Replace this with real error-handling.
@@ -201,9 +287,10 @@ async fn session_login(config: SessionLogin, sessions_file: &mut SessionsFile) -
 
     println!("Please input password for account {}.", &normalized_user_id);
     let password = read_password().unwrap();
+    println!("Attempting login to account {}.", &normalized_user_id);
 
     let user = UserId::parse(&normalized_user_id)?;
-    let client = Client::builder().server_name(user.server_name()).build().await?;
+    let client = Client::builder().server_name(user.server_name()).sqlite_store(store_path, None).build().await?; // Is this doing the store config right?
 
     trace::first_login(&client, sessions_file, &normalized_user_id, &password, config.session_name).await?;
 
@@ -212,8 +299,8 @@ async fn session_login(config: SessionLogin, sessions_file: &mut SessionsFile) -
     Ok(())
 }
 
-async fn session_logout(config: SessionLogout, sessions_file: &mut SessionsFile) -> anyhow::Result<()> {
-    let client = nonfirst_login(&config.user_id, sessions_file).await?;
+async fn session_logout(config: SessionLogout, sessions_file: &mut SessionsFile, store_path: &Path) -> anyhow::Result<()> {
+    let client = nonfirst_login(&config.user_id, sessions_file, store_path).await?;
     trace::logout(&client, sessions_file).await?;
 
     println!("Successfully logged out of account {}.", add_at_to_user_id_if_applicable(&config.user_id));
@@ -221,8 +308,8 @@ async fn session_logout(config: SessionLogout, sessions_file: &mut SessionsFile)
     Ok(())
 }
 
-async fn session_rename(config: SessionRename, sessions_file: &SessionsFile) -> anyhow::Result<()> {
-    let client = nonfirst_login(&config.user_id, sessions_file).await?;
+async fn session_rename(config: SessionRename, sessions_file: &SessionsFile, store_path: &Path) -> anyhow::Result<()> {
+    let client = nonfirst_login(&config.user_id, sessions_file, store_path).await?;
     trace::rename_session(&client, &config.session_name).await?;
 
     println!("Successfully renamed account {}'s session to '{}'.", add_at_to_user_id_if_applicable(&config.user_id), config.session_name);
@@ -230,20 +317,43 @@ async fn session_rename(config: SessionRename, sessions_file: &SessionsFile) -> 
     Ok(())
 }
 
+async fn session_verify(config: SessionVerify, sessions_file: &SessionsFile, store_path: &Path) -> anyhow::Result<()> {
+    println!("Warning: verification, although technically implemented, is currently a mess. You will need to manually ctrl-c out of the verification flow once finished.");
+    // Add a branch for if no incoming verification request is captured in the sync, to produce an outgoing one.
+    let client = nonfirst_login(&config.user_id, sessions_file, store_path).await?;
+    let encryption = client.encryption();
+    client.add_event_handler(|event: ToDeviceKeyVerificationRequestEvent| async move {
+        let user_id = event.sender;
+        let flow_id = event.content.transaction_id;
+        match encryption.get_verification_request(&user_id, flow_id).await {
+            None => (),
+            Some(verification_request) => {
+                tokio::spawn(handle_verification_request(verification_request)); // Asynchronousness is needed to keep the sync going, which is needed for the verification flow to go through successfully
+            }
+        }
+    });
+
+    client.sync(SyncSettings::new().set_presence(PresenceState::Offline)).await?; // Figure out how to stop syncing once the verification is done
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let dirs = ProjectDirs::from("", "", "Trace").unwrap(); // Figure out qualifier and organization
-    let mut sessions_file = SessionsFile::open([dirs.data_dir(), Path::new("sessions.json")].iter().collect());
+    let mut sessions_file = SessionsFile::open([dirs.data_local_dir(), Path::new("sessions.json")].iter().collect());
+    let store_path = dirs.data_local_dir();
 
     let args: Args = argh::from_env();
     match args.subcommand {
-        RootSubcommand::Export(config) => export(config, &sessions_file).await?,
-        RootSubcommand::ListRooms(config) => list_rooms(config, &sessions_file).await?,
+        RootSubcommand::Export(config) => export(config, &sessions_file, store_path).await?,
+        RootSubcommand::ListRooms(config) => list_rooms(config, &sessions_file, store_path).await?,
         RootSubcommand::Session(s) => match s.subcommand {
-            SessionSubcommand::List(_) => session_list(&sessions_file).await?,
-            SessionSubcommand::Login(config) => session_login(config, &mut sessions_file).await?,
-            SessionSubcommand::Logout(config) => session_logout(config, &mut sessions_file).await?,
-            SessionSubcommand::Rename(config) => session_rename(config, &sessions_file).await?,
+            SessionSubcommand::List(_) => session_list(&sessions_file, store_path).await?,
+            SessionSubcommand::Login(config) => session_login(config, &mut sessions_file, store_path).await?,
+            SessionSubcommand::Logout(config) => session_logout(config, &mut sessions_file, store_path).await?,
+            SessionSubcommand::Rename(config) => session_rename(config, &sessions_file, store_path).await?,
+            SessionSubcommand::Verify(config) => session_verify(config, &sessions_file, store_path).await?,
         }
     };
 
