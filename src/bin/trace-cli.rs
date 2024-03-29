@@ -6,6 +6,7 @@ use std::path::{
 
 use trace::{
     ExportOutputFormat,
+    RoomWithCachedInfo,
     SessionsFile,
     add_at_to_user_id_if_applicable,
     nonfirst_login,
@@ -35,6 +36,7 @@ use matrix_sdk::{
     Client,
 };
 use rpassword::read_password;
+use serde::Serialize;
 
 //////////////
 //   Args   //
@@ -80,6 +82,9 @@ struct ListRooms {
     #[argh(positional)]
     /// user id (of the form @alice:example.com) to list rooms from
     user_id: String,
+    #[argh(switch, short = 'j')]
+    /// display room list as JSON rather than as human-readable text
+    json: bool,
 }
 
 #[derive(FromArgs)]
@@ -103,7 +108,11 @@ enum SessionSubcommand {
 #[derive(FromArgs)]
 #[argh(subcommand, name = "list")]
 /// List currently-logged-in accounts
-struct SessionList {}
+struct SessionList {
+    #[argh(switch, short = 'j')]
+    /// display session list as JSON rather than as human-readable text
+    json: bool,
+}
 
 #[derive(FromArgs)]
 #[argh(subcommand, name = "login")]
@@ -145,6 +154,33 @@ struct SessionVerify {
     #[argh(positional)]
     /// user id (of the form @alice:example.com) to verify your session with
     user_id: String,
+}
+
+///////////////////////
+//   Non-arg types   //
+///////////////////////
+
+#[derive(Serialize)]
+struct PrintableRoom {
+    name: Option<String>,
+    alias: Option<String>,
+    id: String,
+}
+
+impl PrintableRoom {
+    fn from_room_info(room_info: RoomWithCachedInfo) -> Self {
+        Self {
+            name: room_info.name,
+            alias: room_info.canonical_alias.map(|alias| alias.to_string()),
+            id: room_info.id.to_string(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct PrintableSession {
+    user_id: String,
+    name: String,
 }
 
 /////////////////
@@ -250,33 +286,49 @@ async fn list_rooms(config: ListRooms, sessions_file: &SessionsFile, dirs: &Proj
     let client = nonfirst_login(&normalized_user_id, sessions_file, &store_path).await?;
     client.sync_once(SyncSettings::new().set_presence(PresenceState::Offline)).await?;
 
-    let rooms_info = trace::get_rooms_info(&client).await?;
-    println!("Rooms joined by {}:", normalized_user_id);
-    for room_info in rooms_info {
-        let room_name = match room_info.name {
-            Some(name) => name,
-            None => String::from("[Unnamed]"),
-        };
-        let room_alias = match room_info.canonical_alias {
-            Some(alias) => alias.to_string(),
-            None => String::from("[No canonical alias]"),
-        };
-        let room_id = room_info.id;
-        println!("{} | {} | {}", room_name, room_alias, room_id) // Replace with properly-justified table-formatting in the future
+    let printable_rooms = trace::get_rooms_info(&client).await?
+        .into_iter()
+        .map(|room_info| PrintableRoom::from_room_info(room_info))
+        .collect::<Vec<PrintableRoom>>();
+    if config.json {
+        println!("{}", serde_json::to_string(&printable_rooms).unwrap());
+    } else {
+        println!("Rooms joined by {}:", normalized_user_id);
+        for room in printable_rooms {
+            let room_name = match room.name {
+                Some(name) => name,
+                None => String::from("[Unnamed]"),
+            };
+            let room_alias = match room.alias {
+                Some(alias) => alias,
+                None => String::from("[No canonical alias]"),
+            };
+            println!("{} | {} | {}", room_name, room_alias, room.id) // Replace with properly-justified table-formatting in the future
+        }
     }
 
     Ok(())
 }
 
-async fn session_list(sessions_file: &SessionsFile, dirs: &ProjectDirs) -> anyhow::Result<()> {
-    let sessions = trace::list_sessions(sessions_file, dirs).await?;
-    if sessions.len() > 0 {
-        println!("Currently-logged-in sessions:");
-        for (user_id, session_name) in sessions {
-            println!("{} | {}", user_id, session_name) // Replace with properly-justified table-formatting in the future
-        }
+async fn session_list(config: SessionList, sessions_file: &SessionsFile, dirs: &ProjectDirs) -> anyhow::Result<()> {
+    let printable_sessions = trace::list_sessions(sessions_file, dirs).await?
+        .into_iter()
+        .map(|(user_id, name)| PrintableSession {
+            user_id,
+            name,
+        })
+        .collect::<Vec<PrintableSession>>();
+    if config.json {
+        println!("{}", serde_json::to_string(&printable_sessions).unwrap());
     } else {
-        println!("You have no sessions currently logged in.");
+        if printable_sessions.len() > 0 {
+            println!("Currently-logged-in sessions:");
+            for session in printable_sessions {
+                println!("{} | {}", session.user_id, session.name) // Replace with properly-justified table-formatting in the future
+            }
+        } else {
+            println!("You have no sessions currently logged in.");
+        }
     }
 
     Ok(())
@@ -307,14 +359,19 @@ async fn session_logout(config: SessionLogout, sessions_file: &mut SessionsFile,
     let store_path = PathBuf::from(dirs.data_local_dir()).join(user_id_to_crypto_store_path(&config.user_id));
     let normalized_user_id = add_at_to_user_id_if_applicable(&config.user_id);
 
-    let mut successful_remote_logout = false;
-    match nonfirst_login(&config.user_id, sessions_file, &store_path).await {
+    let successful_remote_logout = match nonfirst_login(&config.user_id, sessions_file, &store_path).await {
         Ok(client) => match client.matrix_auth().logout().await {
-            Ok(_) => successful_remote_logout = true,
-            Err(e) => println!("Couldn't log out cilent from server due to error '{}'. Logging out on client side only. You may want to double-check your sessions list in case your session is still logged in on the server, in which case you'll need to clear it using a different client.", e),
+            Ok(_) => true,
+            Err(e) => {
+                println!("Couldn't connect cilent to server due to error '{}'. Logging out on client side only. You may want to double-check {}'s sessions list in a different client just in case the session is still logged in on the server side.", e, normalized_user_id);
+                false
+            }
         },
-        Err(e) => println!("Couldn't connect cilent to server due to error '{}'. Logging out on client side only. You may want to double-check your sessions list in case your session is still logged in on the server, in which case you'll need to clear it using a different client.", e),
-    }
+        Err(e) => {
+            println!("Couldn't connect cilent to server due to error '{}'. Logging out on client side only. You may want to double-check {}'s sessions list in a different client just in case the session is still logged in on the server side.", e, normalized_user_id);
+            false
+        }
+    };
     trace::logout_local(&config.user_id, sessions_file, &store_path)?;
     if successful_remote_logout {
         println!("Successfully logged out of account {}.", normalized_user_id);
@@ -367,7 +424,7 @@ async fn main() -> anyhow::Result<()> {
         RootSubcommand::Export(config) => export(config, &sessions_file, &dirs).await?,
         RootSubcommand::ListRooms(config) => list_rooms(config, &sessions_file, &dirs).await?,
         RootSubcommand::Session(s) => match s.subcommand {
-            SessionSubcommand::List(_) => session_list(&sessions_file, &dirs).await?,
+            SessionSubcommand::List(config) => session_list(config, &sessions_file, &dirs).await?,
             SessionSubcommand::Login(config) => session_login(config, &mut sessions_file, &dirs).await?,
             SessionSubcommand::Logout(config) => session_logout(config, &mut sessions_file, &dirs).await?,
             SessionSubcommand::Rename(config) => session_rename(config, &sessions_file, &dirs).await?,

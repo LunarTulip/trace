@@ -48,9 +48,9 @@ pub use export::{
     ExportOutputFormat,
 };
 
-///////////////////////
-//   Non-arg types   //
-///////////////////////
+///////////////
+//   Types   //
+///////////////
 
 #[derive(Clone, Deserialize, Serialize)]
 pub struct Session {
