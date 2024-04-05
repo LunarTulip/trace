@@ -35,7 +35,6 @@ use serde::{
     Deserialize,
     Serialize,
 };
-use uuid::Uuid;
 
 pub mod export;
 
@@ -176,18 +175,19 @@ pub async fn nonfirst_login(user_id: &str, sessions_file: &SessionsFile, store_p
 ///////////////////////////////
 
 pub async fn first_login(client: &Client, sessions_file: &mut SessionsFile, user_id: &str, password: &str, session_name: Option<String>) -> anyhow::Result<()> {
-    let deoptionalized_session_name = match session_name {
-        Some(name) => name,
-        None => format!("Trace (Session UUID: {})", Uuid::new_v4())
-    };
-
     let auth = client.matrix_auth();
     let supported_login_types = auth.get_login_types().await?.flows;
     let login_result = if supported_login_types.iter().any(|login_type| match login_type {
         LoginType::Password(_) => true,
         _ => false,
     }) {
-        auth.login_username(user_id, password).initial_device_display_name(&deoptionalized_session_name).send().await?
+        let login_request = auth.login_username(user_id, password);
+        if let Some(name) = session_name {
+            login_request.initial_device_display_name(&name).send().await?
+        } else {
+            // Do we want some sort of default name here?
+            login_request.send().await?
+        }
     } else {
         panic!("Attempted login to a server which lacks password-based login support. (SSO support will be added eventually.)");
     };

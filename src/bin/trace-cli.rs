@@ -206,7 +206,7 @@ async fn handle_verification_request(verification_request: VerificationRequest) 
                                     match input.trim().to_ascii_lowercase().as_ref() {
                                         "y" | "yes" => {
                                             sas_verification.confirm().await?;
-                                            println!("Verified.");
+                                            println!("Verified. Make sure verification has finished on the other end, then ctrl-c out.");
                                             // Add checking to ensure verification succeeds on the remote end as well before breaking
                                             break
                                         }
